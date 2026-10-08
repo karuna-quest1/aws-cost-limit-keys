@@ -16,7 +16,7 @@ deploy:
 # this one, so this is the only place a number has to be kept current.
 #
 # enforce stays false until the rate card has been reconciled against Cost
-# Explorer -- see SETUP.md, the watch-only week.
+# Explorer -- see README.md, the watch-only week.
 seed:
 	aws dynamodb put-item --table-name $(TABLE) --item '{ \
 	  "scope":{"S":"DEFAULT"}, "daily_usd":{"N":"$(DAILY)"}, \

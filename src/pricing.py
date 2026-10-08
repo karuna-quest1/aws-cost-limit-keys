@@ -45,7 +45,7 @@ def _d(value: str) -> Decimal:
 
 # USD per million tokens, on-demand, us-east-1. THESE MUST BE VERIFIED against
 # https://aws.amazon.com/bedrock/pricing/ before enforcement is switched on, and
-# reconciled monthly thereafter. See SETUP.md, the watch-only week.
+# reconciled monthly thereafter. See README.md, the watch-only week.
 #
 # Four rates per model, not two: cache reads bill at a tenth of input and these
 # workloads lean on caching, so collapsing them overstates the expensive flows.

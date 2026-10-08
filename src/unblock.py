@@ -2,7 +2,7 @@
 
 The rota is granted `lambda:InvokeFunction` on this, not `iam:UpdateAccessKey`.
 Refusals raise; returning {"ok": false} would exit 0 and read as success.
-Invoke it with `make unblock TRACK=<name> REASON='...'` -- see SETUP.md.
+Invoke it with `make unblock TRACK=<name> REASON='...'` -- see README.md.
 """
 
 from __future__ import annotations

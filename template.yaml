@@ -1,0 +1,262 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Per-track Bedrock cost guardrails - meter, alert, and deactivate on runaway spend.
+
+Parameters:
+  BedrockLogGroupName:
+    Type: String
+    Default: /aws/bedrock/modelinvocations
+    Description: >
+      Log group that Bedrock model invocation logging writes to. NOTE: enabling
+      invocation logging itself is NOT a CloudFormation resource. Do it once per
+      region, with every data-type checkbox UNCHECKED so token counts are
+      recorded but no prompt or response text is.
+
+  PrincipalNamePattern:
+    Type: String
+    Default: BedrockDev-*
+    Description: >
+      IAM user name pattern the guardrail may read tags from and deactivate keys
+      on. Scoping this is the difference between a least-privilege control and a
+      Lambda that can disable any identity in the account.
+
+      Every matching principal must carry a `Track` tag. Track is the only
+      attribution dimension: the budget boundary, the ledger partition and the
+      thing a key is deactivated for. An untagged principal raises on every log
+      line it produces until it is tagged.
+
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: Optional. Subscribed to the alert topic on create.
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+
+Globals:
+  Function:
+    Runtime: python3.12
+    MemorySize: 256
+    Timeout: 30
+    CodeUri: src/
+    Environment:
+      Variables:
+        USAGE_TABLE: !Ref UsageTable
+        BUDGET_TABLE: !Ref BudgetTable
+        # The fallback topic, used when a budget row does not name its own. It is
+        # what makes the "this track has no budget row" alert deliverable at all:
+        # a row that does not exist cannot name a topic. An alert with nowhere to
+        # go is an error, not a log line, so this is not optional.
+        NOTIFY_TOPIC_ARN: !Ref AlertTopic
+        LOG_LEVEL: INFO
+
+Resources:
+  # --- storage -------------------------------------------------------------
+  UsageTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: bedrock_usage
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: pk, AttributeType: S }
+        - { AttributeName: sk, AttributeType: S }
+        - { AttributeName: day, AttributeType: S }
+      KeySchema:
+        - { AttributeName: pk, KeyType: HASH }
+        - { AttributeName: sk, KeyType: RANGE }
+      # Sparse: only the daily pool rows carry `day`, so the index holds nothing
+      # else. One query returns every track's spend for a date. The disabled
+      # record stores its date as `disabled_day` for exactly this reason -- it
+      # never expires, so under `day` it would sit in this index forever.
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1
+          KeySchema:
+            - { AttributeName: day, KeyType: HASH }
+            - { AttributeName: pk, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      SSESpecification: { SSEEnabled: true }
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+
+  BudgetTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: bedrock_budgets
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: scope, AttributeType: S }
+      KeySchema:
+        - { AttributeName: scope, KeyType: HASH }
+      SSESpecification: { SSEEnabled: true }
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+
+  MeterDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: bedrock-guardrail-meter-dlq
+      # Long, because the retention clock is the window in which a human has to
+      # notice and replay. Spend that failed to record is not recoverable from
+      # anywhere else: the Bedrock log group's own retention is the only other
+      # copy, and reconstructing from it by hand is a different afternoon.
+      MessageRetentionPeriod: 1209600  # 14 days, the maximum
+      SqsManagedSseEnabled: true
+
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: bedrock-guardrail-alerts
+      DisplayName: Bedrock guardrail
+
+  AlertSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # --- metering ------------------------------------------------------------
+  MeterFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: bedrock-guardrail-meter
+      Handler: handler.handler
+      Description: Prices each Bedrock invocation, accumulates it, alerts, deactivates on runaway.
+      # One concurrent execution is not required for correctness -- every write
+      # is conditional or an atomic ADD -- but it keeps IAM tag lookups and
+      # DynamoDB writes to a sane rate while the design is young.
+      ReservedConcurrentExecutions: 10
+      # A CloudWatch Logs subscription filter invokes asynchronously, so a raised
+      # exception is retried automatically. That is load-bearing: every AWS
+      # failure in this function raises rather than degrading, and
+      # ledger.claim_count makes the retry cheap -- work already recorded is not
+      # recorded again, so only the unfinished log lines do anything.
+      #
+      # After the retries, the batch goes to the DLQ rather than being dropped.
+      # The queued message is the original gzipped CloudWatch event, so it can be
+      # replayed once the cause is fixed. Nothing re-drives it automatically: a
+      # guardrail that silently retries a poison batch forever is a guardrail
+      # nobody is watching.
+      EventInvokeConfig:
+        MaximumRetryAttempts: 2
+        MaximumEventAgeInSeconds: 3600
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt MeterDeadLetterQueue.Arn
+      Events:
+        BedrockInvocations:
+          Type: CloudWatchLogs
+          Properties:
+            LogGroupName: !Ref BedrockLogGroupName
+            FilterPattern: ""
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref UsageTable }
+        - DynamoDBReadPolicy: { TableName: !Ref BudgetTable }
+        - Statement:
+            - Effect: Allow
+              Action: [sns:Publish]
+              Resource: !Ref AlertTopic
+            - Effect: Allow
+              Action: [iam:ListUserTags, iam:ListAccessKeys]
+              Resource: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:user/${PrincipalNamePattern}
+            - Effect: Allow
+              Action: [iam:ListRoleTags]
+              Resource: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${PrincipalNamePattern}
+            # The one permission with teeth.
+            #
+            # iam:UpdateAccessKey performs BOTH directions -- which one happens
+            # is decided by the Status request parameter (Inactive / Active),
+            # not by the action name. IAM publishes no condition key for an
+            # access key's status, so this grant cannot be narrowed to the
+            # deactivate direction alone.
+            #
+            # Deactivate-only is therefore enforced in application code:
+            # enforce.deactivate_keys() never passes Status="Active". That is a
+            # behavioural restriction, not an IAM one. A real boundary needs the
+            # deactivate call in its own function holding this permission alone.
+            - Effect: Allow
+              Action: [iam:UpdateAccessKey]
+              Resource: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:user/${PrincipalNamePattern}
+
+  # --- release -------------------------------------------------------------
+  UnblockFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: bedrock-guardrail-unblock
+      Handler: unblock.handler
+      Description: >
+        Re-enables a disabled track. Invoked by the on-call rota, never on a
+        schedule: a key past the runaway ceiling means something was looping, and
+        a breaker that resets itself into the fault is a slower fire.
+
+        Refusals raise. A Lambda that returns {"ok": false} exits 0, so any
+        wrapper reads the refusal as success.
+      Environment:
+        Variables:
+          NOTIFY_TOPIC_ARN: !Ref AlertTopic
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref UsageTable }
+        # Read-only, and only to resolve which topic this track's alerts go to,
+        # so the release announcement lands where the disable page did. This
+        # function must never be able to change a budget.
+        - DynamoDBReadPolicy: { TableName: !Ref BudgetTable }
+        - Statement:
+            - Effect: Allow
+              Action: [sns:Publish]
+              Resource: !Ref AlertTopic
+            - Effect: Allow
+              Action: [iam:UpdateAccessKey]
+              Resource: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:user/${PrincipalNamePattern}
+
+  # --- alarms --------------------------------------------------------------
+  MeterErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: bedrock-guardrail-meter-errors
+      AlarmDescription: >
+        The meter is failing. While it is down nothing is counted and nothing is
+        enforced, and no alert will tell you that -- which is why this alarm
+        exists separately from the guardrail's own notifications.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{ Name: FunctionName, Value: !Ref MeterFunction }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  MeterDeadLetterAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: bedrock-guardrail-meter-dlq-not-empty
+      AlarmDescription: >
+        A batch of Bedrock invocation log lines exhausted its retries. That spend
+        is not in the ledger, so every budget and every ceiling for the affected
+        tracks is reading low until the batch is replayed. MeterErrorAlarm fires
+        on the first failure; this one fires on the failures that gave up.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [{ Name: QueueName, Value: !GetAtt MeterDeadLetterQueue.QueueName }]
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+Outputs:
+  UsageTableName: { Value: !Ref UsageTable }
+  BudgetTableName: { Value: !Ref BudgetTable }
+  AlertTopicArn: { Value: !Ref AlertTopic }
+  MeterDeadLetterQueueUrl: { Value: !Ref MeterDeadLetterQueue }
+  UnblockCommand:
+    Description: How the on-call rota re-enables a track.
+    Value: !Sub >-
+      aws lambda invoke --function-name ${UnblockFunction}
+      --payload '{"track":"<name>","reason":"<what you found>"}' /dev/stdout

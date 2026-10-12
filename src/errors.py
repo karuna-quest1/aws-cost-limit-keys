@@ -8,7 +8,7 @@ alerted daily -- `pricing.FALLBACK` and `budgets.FLOOR_DAILY_USD`.
 from __future__ import annotations
 
 __all__ = [
-    "GuardrailError",
+    "CostLimitError",
     "MalformedLogEntry",
     "AttributionUnavailable",
     "UntaggedPrincipal",
@@ -27,43 +27,43 @@ __all__ = [
 ]
 
 
-class GuardrailError(Exception):
+class CostLimitError(Exception):
     """Base for every failure this project raises deliberately."""
 
 
-class MalformedLogEntry(GuardrailError):
+class MalformedLogEntry(CostLimitError):
     """A log line is not a usable ModelInvocationLog."""
 
 
-class AttributionUnavailable(GuardrailError):
+class AttributionUnavailable(CostLimitError):
     """Could not determine the track. Transient -- retry is the right response."""
 
 
-class UntaggedPrincipal(GuardrailError):
+class UntaggedPrincipal(CostLimitError):
     """No `Track` tag. Permanent until someone tags the key."""
 
 
-class BudgetUnavailable(GuardrailError):
+class BudgetUnavailable(CostLimitError):
     """The budget table could not be read."""
 
 
-class InvalidBudget(GuardrailError):
+class InvalidBudget(CostLimitError):
     """A configured budget value is not usable."""
 
 
-class LedgerWriteFailed(GuardrailError):
+class LedgerWriteFailed(CostLimitError):
     """A DynamoDB write the meter depends on did not happen."""
 
 
-class AlertDeliveryFailed(GuardrailError):
+class AlertDeliveryFailed(CostLimitError):
     """The alert did not reach SNS. Fatal: the threshold claim is already spent."""
 
 
-class KeyLookupFailed(GuardrailError):
+class KeyLookupFailed(CostLimitError):
     """Could not list a principal's keys. Distinct from "has no keys" (empty set)."""
 
 
-class DeactivationFailed(GuardrailError):
+class DeactivationFailed(CostLimitError):
     """At least one key that should be inactive is still active."""
 
     def __init__(self, message: str, *, deactivated=(), still_active=()):
@@ -72,11 +72,11 @@ class DeactivationFailed(GuardrailError):
         self.still_active = tuple(still_active)
 
 
-class NotDisabled(GuardrailError):
+class NotDisabled(CostLimitError):
     """Asked to re-enable a track that is not disabled."""
 
 
-class ReactivationFailed(GuardrailError):
+class ReactivationFailed(CostLimitError):
     """At least one key could not be set back to Active."""
 
     def __init__(self, message: str, *, reactivated=(), still_inactive=()):
@@ -85,14 +85,16 @@ class ReactivationFailed(GuardrailError):
         self.still_inactive = tuple(still_inactive)
 
 
-class BatchIncomplete(GuardrailError):
+class BatchIncomplete(CostLimitError):
     """Some log lines failed. Raised after every line has been attempted."""
 
     def __init__(self, stats: dict, failures):
         self.stats = dict(stats)
         self.failures = list(failures)
-        detail = "; ".join(f"{rid}: {exc!r}" for rid, exc in self.failures[:5])
-        super().__init__(f"{len(self.failures)} of {stats.get('seen', 0)} log lines failed -- {detail}")
+        detail = "; ".join(f"{request_id}: {exc!r}" for request_id, exc in self.failures[:5])
+        super().__init__(
+            f"{len(self.failures)} of {stats.get('seen', 0)} log lines failed -- {detail}"
+        )
 
 
 # botocore raises one class, ClientError, for everything; the discriminator is a

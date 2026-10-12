@@ -54,11 +54,11 @@ def cloudwatch_event(entries):
         "logStream": "aws/bedrock/modelinvocations",
         "logEvents": [
             {
-                "id": str(i),
-                "timestamp": 1_760_000_000_000 + i,
-                "message": e if isinstance(e, str) else json.dumps(e),
+                "id": str(index),
+                "timestamp": 1_760_000_000_000 + index,
+                "message": entry if isinstance(entry, str) else json.dumps(entry),
             }
-            for i, e in enumerate(entries)
+            for index, entry in enumerate(entries)
         ],
     }
     blob = gzip.compress(json.dumps(payload).encode())

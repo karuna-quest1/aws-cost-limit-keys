@@ -5,7 +5,7 @@ from __future__ import annotations
 from decimal import Decimal, ROUND_HALF_UP
 from typing import NamedTuple
 
-__all__ = ["Rates", "Usage", "Priced", "price", "usage_from_log", "RATES", "FALLBACK"]
+__all__ = ["Rates", "Usage", "PricedUsage", "price", "usage_from_log", "RATES", "FALLBACK"]
 
 
 class Rates(NamedTuple):
@@ -33,13 +33,13 @@ class Usage(NamedTuple):
         )
 
 
-class Priced(NamedTuple):
+class PricedUsage(NamedTuple):
     micros: int
     rate_card: str
     is_fallback: bool
 
 
-def _d(value: str) -> Decimal:
+def _rate(value: str) -> Decimal:
     return Decimal(value)
 
 
@@ -51,32 +51,32 @@ def _d(value: str) -> Decimal:
 # workloads lean on caching, so collapsing them overstates the expensive flows.
 RATES: dict[str, Rates] = {
     "anthropic.claude-sonnet-4-5-20250929-v1:0": Rates(
-        input=_d("3.00"),
-        output=_d("15.00"),
-        cache_read=_d("0.30"),
-        cache_write=_d("3.75"),
+        input=_rate("3.00"),
+        output=_rate("15.00"),
+        cache_read=_rate("0.30"),
+        cache_write=_rate("3.75"),
     ),
     "anthropic.claude-haiku-4-5-20251001-v1:0": Rates(
-        input=_d("1.00"),
-        output=_d("5.00"),
-        cache_read=_d("0.10"),
-        cache_write=_d("1.25"),
+        input=_rate("1.00"),
+        output=_rate("5.00"),
+        cache_read=_rate("0.10"),
+        cache_write=_rate("1.25"),
     ),
     "anthropic.claude-opus-4-1-20250805-v1:0": Rates(
-        input=_d("15.00"),
-        output=_d("75.00"),
-        cache_read=_d("1.50"),
-        cache_write=_d("18.75"),
+        input=_rate("15.00"),
+        output=_rate("75.00"),
+        cache_read=_rate("1.50"),
+        cache_write=_rate("18.75"),
     ),
 }
 
 # Unlisted model. Deliberately above Opus: raising would leave the invocation
 # unrecorded, which is an unlimited budget. `is_fallback` drives a daily alert.
 FALLBACK = Rates(
-    input=_d("20.00"),
-    output=_d("100.00"),
-    cache_read=_d("2.00"),
-    cache_write=_d("25.00"),
+    input=_rate("20.00"),
+    output=_rate("100.00"),
+    cache_read=_rate("2.00"),
+    cache_write=_rate("25.00"),
 )
 
 # Cross-region inference profiles prefix the model id with a geography.
@@ -85,11 +85,11 @@ _GEO_PREFIXES = ("us.", "eu.", "apac.", "us-gov.", "global.")
 
 def normalize_model_id(model_id: str) -> str:
     """Strip a geography prefix (`us.`, `eu.`...) so one card entry serves all."""
-    mid = (model_id or "").strip()
+    normalized = (model_id or "").strip()
     for prefix in _GEO_PREFIXES:
-        if mid.startswith(prefix):
-            return mid[len(prefix) :]
-    return mid
+        if normalized.startswith(prefix):
+            return normalized[len(prefix) :]
+    return normalized
 
 
 def lookup(model_id: str, region: str | None = None) -> tuple[Rates, str, bool]:
@@ -101,17 +101,17 @@ def lookup(model_id: str, region: str | None = None) -> tuple[Rates, str, bool]:
     return rates, key, False
 
 
-def price(usage: Usage, model_id: str, region: str | None = None) -> Priced:
+def price(usage: Usage, model_id: str, region: str | None = None) -> PricedUsage:
     """Cost of one invocation in micro-USD. tokens * usd_per_million, no division."""
-    rates, card, is_fallback = lookup(model_id, region)
-    total = (
+    rates, rate_card_key, is_fallback = lookup(model_id, region)
+    total_micros = (
         Decimal(usage.input_tokens) * rates.input
         + Decimal(usage.output_tokens) * rates.output
         + Decimal(usage.cache_read_tokens) * rates.cache_read
         + Decimal(usage.cache_write_tokens) * rates.cache_write
     )
-    micros = int(total.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
-    return Priced(micros=micros, rate_card=card, is_fallback=is_fallback)
+    micros = int(total_micros.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    return PricedUsage(micros=micros, rate_card=rate_card_key, is_fallback=is_fallback)
 
 
 def usage_from_log(entry: dict) -> Usage:
@@ -119,11 +119,11 @@ def usage_from_log(entry: dict) -> Usage:
     # The cache fields are real but absent from AWS's documented schema table.
     # Do not delete them after reading the reference -- confirm the spelling
     # against a real log line instead.
-    inp = entry.get("input") or {}
-    out = entry.get("output") or {}
+    input_counts = entry.get("input") or {}
+    output_counts = entry.get("output") or {}
     return Usage(
-        input_tokens=int(inp.get("inputTokenCount") or 0),
-        output_tokens=int(out.get("outputTokenCount") or 0),
-        cache_read_tokens=int(inp.get("cacheReadInputTokenCount") or 0),
-        cache_write_tokens=int(inp.get("cacheWriteInputTokenCount") or 0),
+        input_tokens=int(input_counts.get("inputTokenCount") or 0),
+        output_tokens=int(output_counts.get("outputTokenCount") or 0),
+        cache_read_tokens=int(input_counts.get("cacheReadInputTokenCount") or 0),
+        cache_write_tokens=int(input_counts.get("cacheWriteInputTokenCount") or 0),
     )

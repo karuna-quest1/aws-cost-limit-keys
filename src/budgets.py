@@ -1,7 +1,7 @@
 """The per-track budget: TRACK# merged over DEFAULT over a floor, validated.
 
 A merge, not a first match: a row setting one field would otherwise fall to the
-$10 floor, which is the rollout happy path. See SETUP.md.
+$10 floor, which is the rollout happy path. See README.md.
 """
 
 from __future__ import annotations
@@ -12,13 +12,13 @@ from typing import NamedTuple
 
 from errors import BudgetUnavailable, InvalidBudget
 
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 __all__ = ["Budget", "load", "FLOOR_DAILY_USD", "FLOOR_SCOPE"]
 
 # Only when neither a track row nor DEFAULT exists. A newly issued key must not
 # be unlimited, and raising would mean no limit is evaluated at all. Alerted
-# daily by handler.react.
+# daily by handler.apply_budget_policy.
 FLOOR_DAILY_USD = Decimal("10")
 FLOOR_SCOPE = "FLOOR"
 
@@ -50,37 +50,41 @@ class Budget(NamedTuple):
         return self.scope == FLOOR_SCOPE
 
 
-def _decimal(item: dict, field: str, default: Decimal, scope: str) -> Decimal:
-    raw = item.get(field)
-    if raw is None:
-        return default
+def _decimal(item: dict, field: str, fallback: Decimal, scope: str) -> Decimal:
+    value = item.get(field)
+    if value is None:
+        return fallback
     try:
-        return Decimal(str(raw))
+        return Decimal(str(value))
     except (InvalidOperation, ValueError, TypeError) as exc:
-        raise InvalidBudget(f"{scope}.{field} is not a number: {raw!r}") from exc
+        raise InvalidBudget(f"{scope}.{field} is not a number: {value!r}") from exc
 
 
 def _alert_pcts(item: dict, scope: str) -> tuple[int, ...]:
-    raw = item.get("alert_pcts")
-    if raw is None:
+    value = item.get("alert_pcts")
+    if value is None:
         return _DEFAULT_ALERT_PCTS
     try:
-        pcts = tuple(sorted(int(p) for p in raw))
+        percents = tuple(sorted(int(percent) for percent in value))
     except (TypeError, ValueError) as exc:
-        raise InvalidBudget(f"{scope}.alert_pcts is not a set of numbers: {raw!r}") from exc
-    if not pcts:
+        raise InvalidBudget(f"{scope}.alert_pcts is not a set of numbers: {value!r}") from exc
+    if not percents:
         raise InvalidBudget(
             f"{scope}.alert_pcts is empty. An empty set means no threshold is ever "
             f"announced; remove the attribute to take the default "
             f"{_DEFAULT_ALERT_PCTS} instead."
         )
-    bad = [p for p in pcts if p <= 0 or p > _MAX_ALERT_PCT]
-    if bad:
-        raise InvalidBudget(f"{scope}.alert_pcts has values outside 1..{_MAX_ALERT_PCT}: {bad}")
-    return pcts
+    out_of_range = [
+        percent for percent in percents if percent <= 0 or percent > _MAX_ALERT_PCT
+    ]
+    if out_of_range:
+        raise InvalidBudget(
+            f"{scope}.alert_pcts has values outside 1..{_MAX_ALERT_PCT}: {out_of_range}"
+        )
+    return percents
 
 
-def _coerce(item: dict, scope: str) -> Budget:
+def _to_budget(item: dict, scope: str) -> Budget:
     daily_usd = _decimal(item, "daily_usd", FLOOR_DAILY_USD, scope)
     if daily_usd <= 0:
         raise InvalidBudget(
@@ -89,39 +93,39 @@ def _coerce(item: dict, scope: str) -> Budget:
             f"disables the limit rather than the track."
         )
 
-    multiple = _decimal(item, "runaway_multiple", _DEFAULT_RUNAWAY_MULTIPLE, scope)
-    if multiple < _MIN_RUNAWAY_MULTIPLE:
+    runaway_multiple = _decimal(item, "runaway_multiple", _DEFAULT_RUNAWAY_MULTIPLE, scope)
+    if runaway_multiple < _MIN_RUNAWAY_MULTIPLE:
         raise InvalidBudget(
             f"{scope}.runaway_multiple must be at least {_MIN_RUNAWAY_MULTIPLE}, "
-            f"got {multiple}. Below 1 the key is deactivated before the 100% "
+            f"got {runaway_multiple}. Below 1 the key is deactivated before the 100% "
             f"alert is sent."
         )
 
-    enforce_raw = item.get("enforce", False)
-    if not isinstance(enforce_raw, bool):
+    enforce_value = item.get("enforce", False)
+    if not isinstance(enforce_value, bool):
         raise InvalidBudget(
-            f"{scope}.enforce must be a boolean, got {type(enforce_raw).__name__} "
-            f"({enforce_raw!r}). A string 'false' is truthy and would start "
+            f"{scope}.enforce must be a boolean, got {type(enforce_value).__name__} "
+            f"({enforce_value!r}). A string 'false' is truthy and would start "
             f"deactivating keys."
         )
 
-    topic = item.get("notify_topic_arn")
-    if topic is not None and not str(topic).startswith("arn:"):
-        raise InvalidBudget(f"{scope}.notify_topic_arn is not an ARN: {topic!r}")
+    topic_arn = item.get("notify_topic_arn")
+    if topic_arn is not None and not str(topic_arn).startswith("arn:"):
+        raise InvalidBudget(f"{scope}.notify_topic_arn is not an ARN: {topic_arn!r}")
 
     daily_micros = int(daily_usd * 1_000_000)
     return Budget(
         scope=scope,
         daily_micros=daily_micros,
         alert_pcts=_alert_pcts(item, scope),
-        runaway_micros=int(Decimal(daily_micros) * multiple),
-        notify_topic_arn=topic,
+        runaway_micros=int(Decimal(daily_micros) * runaway_multiple),
+        notify_topic_arn=topic_arn,
         # Absent means watch-only: enforcement is opt-in.
-        enforce=enforce_raw,
+        enforce=enforce_value,
     )
 
 
-def _read(table, scope: str) -> dict | None:
+def _read_row(table, scope: str) -> dict | None:
     try:
         return table.get_item(Key={"scope": scope}).get("Item")
     except Exception as exc:
@@ -133,19 +137,19 @@ def _read(table, scope: str) -> dict | None:
 def load(table, track: str) -> Budget:
     """One read when the track's row is complete, two when partial or absent."""
     scope = f"TRACK#{track}"
-    row = _read(table, scope)
+    row = _read_row(table, scope)
 
     if row is not None and all(field in row for field in _INHERITABLE):
-        return _coerce(row, scope)
+        return _to_budget(row, scope)
 
-    default = _read(table, "DEFAULT")
-    if row is None and default is None:
-        return _coerce({}, FLOOR_SCOPE)
+    default_row = _read_row(table, "DEFAULT")
+    if row is None and default_row is None:
+        return _to_budget({}, FLOOR_SCOPE)
 
-    merged = dict(default or {})
-    merged.update({k: v for k, v in (row or {}).items() if v is not None})
-    if row is not None and default is not None:
+    merged = dict(default_row or {})
+    merged.update({key: value for key, value in (row or {}).items() if value is not None})
+    if row is not None and default_row is not None:
         inherited = sorted(set(_INHERITABLE) - set(row))
         if inherited:
-            log.info("%s inherited %s from DEFAULT", scope, inherited)
-    return _coerce(merged, scope if row is not None else "DEFAULT")
+            logger.info("%s inherited %s from DEFAULT", scope, inherited)
+    return _to_budget(merged, scope if row is not None else "DEFAULT")

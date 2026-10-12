@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
-Description: Per-track Bedrock cost guardrails - meter, alert, and deactivate on runaway spend.
+Description: Per-track Bedrock cost limits - meter, alert, and deactivate on runaway spend.
 
 Parameters:
   BedrockLogGroupName:
@@ -16,7 +16,7 @@ Parameters:
     Type: String
     Default: BedrockDev-*
     Description: >
-      IAM user name pattern the guardrail may read tags from and deactivate keys
+      IAM user name pattern this control may read tags from and deactivate keys
       on. Scoping this is the difference between a least-privilege control and a
       Lambda that can disable any identity in the account.
 
@@ -95,7 +95,7 @@ Resources:
   MeterDeadLetterQueue:
     Type: AWS::SQS::Queue
     Properties:
-      QueueName: bedrock-guardrail-meter-dlq
+      QueueName: bedrock-cost-limits-meter-dlq
       # Long, because the retention clock is the window in which a human has to
       # notice and replay. Spend that failed to record is not recoverable from
       # anywhere else: the Bedrock log group's own retention is the only other
@@ -106,8 +106,8 @@ Resources:
   AlertTopic:
     Type: AWS::SNS::Topic
     Properties:
-      TopicName: bedrock-guardrail-alerts
-      DisplayName: Bedrock guardrail
+      TopicName: bedrock-cost-limits-alerts
+      DisplayName: Bedrock cost limits
 
   AlertSubscription:
     Type: AWS::SNS::Subscription
@@ -121,7 +121,7 @@ Resources:
   MeterFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: bedrock-guardrail-meter
+      FunctionName: bedrock-cost-limits-meter
       Handler: handler.handler
       Description: Prices each Bedrock invocation, accumulates it, alerts, deactivates on runaway.
       # One concurrent execution is not required for correctness -- every write
@@ -137,7 +137,7 @@ Resources:
       # After the retries, the batch goes to the DLQ rather than being dropped.
       # The queued message is the original gzipped CloudWatch event, so it can be
       # replayed once the cause is fixed. Nothing re-drives it automatically: a
-      # guardrail that silently retries a poison batch forever is a guardrail
+      # control that silently retries a poison batch forever is a control
       # nobody is watching.
       EventInvokeConfig:
         MaximumRetryAttempts: 2
@@ -184,7 +184,7 @@ Resources:
   UnblockFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: bedrock-guardrail-unblock
+      FunctionName: bedrock-cost-limits-unblock
       Handler: unblock.handler
       Description: >
         Re-enables a disabled track. Invoked by the on-call rota, never on a
@@ -214,11 +214,11 @@ Resources:
   MeterErrorAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
-      AlarmName: bedrock-guardrail-meter-errors
+      AlarmName: bedrock-cost-limits-meter-errors
       AlarmDescription: >
         The meter is failing. While it is down nothing is counted and nothing is
         enforced, and no alert will tell you that -- which is why this alarm
-        exists separately from the guardrail's own notifications.
+        exists separately from this control's own notifications.
       Namespace: AWS/Lambda
       MetricName: Errors
       Dimensions: [{ Name: FunctionName, Value: !Ref MeterFunction }]
@@ -233,7 +233,7 @@ Resources:
   MeterDeadLetterAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
-      AlarmName: bedrock-guardrail-meter-dlq-not-empty
+      AlarmName: bedrock-cost-limits-meter-dlq-not-empty
       AlarmDescription: >
         A batch of Bedrock invocation log lines exhausted its retries. That spend
         is not in the ledger, so every budget and every ceiling for the affected

@@ -16,12 +16,12 @@ import enforce
 import ledger
 from errors import MalformedLogEntry, NotDisabled, ReactivationFailed
 
-log = logging.getLogger()
-log.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
+logger = logging.getLogger()
+logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
 USAGE_TABLE = os.environ.get("USAGE_TABLE", "bedrock_usage")
 BUDGET_TABLE = os.environ.get("BUDGET_TABLE", "bedrock_budgets")
-# Fallback only; the budget row's own topic wins. See `_topic_for`.
+# Fallback only; the budget row's own topic wins. See `_topic_for_track`.
 NOTIFY_TOPIC_ARN = os.environ.get("NOTIFY_TOPIC_ARN")
 MIN_REASON_CHARS = 10
 
@@ -34,31 +34,31 @@ def clients():
         from botocore.config import Config
 
         config = Config(retries={"max_attempts": 5, "mode": "adaptive"})
-        ddb = boto3.resource("dynamodb", config=config)
+        dynamodb = boto3.resource("dynamodb", config=config)
         _clients.update(
-            usage=ddb.Table(USAGE_TABLE),
+            usage=dynamodb.Table(USAGE_TABLE),
             # Read-only, and only to find out where this track's alerts go.
-            budgets=ddb.Table(BUDGET_TABLE),
+            budgets=dynamodb.Table(BUDGET_TABLE),
             iam=boto3.client("iam", config=config),
             sns=boto3.client("sns", config=config),
         )
     return _clients
 
 
-def _topic_for(c: dict, track: str) -> str | None:
+def _topic_for_track(aws_clients: dict, track: str) -> str | None:
     """The track's own topic, else the default. Resolved before any mutation."""
-    return budgets.load(c["budgets"], track).notify_topic_arn or NOTIFY_TOPIC_ARN
+    return budgets.load(aws_clients["budgets"], track).notify_topic_arn or NOTIFY_TOPIC_ARN
 
 
 def _pairs_from(item: dict) -> list[tuple[str, str]]:
     """The (user, key id) pairs recorded at disable time."""
-    pairs = []
-    for raw in sorted(item.get("keys") or []):
-        user, _, key_id = str(raw).partition("/")
+    key_pairs = []
+    for record in sorted(item.get("keys") or []):
+        user, _, key_id = str(record).partition("/")
         if not user or not key_id:
-            raise ReactivationFailed(f"unusable key record {raw!r} on the disabled item")
-        pairs.append((user, key_id))
-    return pairs
+            raise ReactivationFailed(f"unusable key record {record!r} on the disabled item")
+        key_pairs.append((user, key_id))
+    return key_pairs
 
 
 def handler(event, context):
@@ -79,8 +79,8 @@ def handler(event, context):
             f"spent the money, confirm it has stopped, then re-enable."
         )
 
-    c = clients()
-    item = ledger.read_disabled(c["usage"], track)
+    aws_clients = clients()
+    item = ledger.read_disabled(aws_clients["usage"], track)
     if not item:
         raise NotDisabled(
             f"{track} is not disabled, so there is nothing to re-enable. "
@@ -89,49 +89,51 @@ def handler(event, context):
 
     # Before the first IAM call, so a budget problem refuses rather than
     # half-performs the release.
-    topic = _topic_for(c, track)
+    topic_arn = _topic_for_track(aws_clients, track)
 
-    pairs = _pairs_from(item)
-    reactivated, failed = [], {}
-    for user_name, key_id in pairs:
+    key_pairs = _pairs_from(item)
+    reactivated, failures = [], {}
+    for user_name, key_id in key_pairs:
         try:
-            c["iam"].update_access_key(UserName=user_name, AccessKeyId=key_id, Status="Active")
+            aws_clients["iam"].update_access_key(
+                UserName=user_name, AccessKeyId=key_id, Status="Active"
+            )
             reactivated.append(key_id)
         except Exception as exc:  # noqa: BLE001 - every key is attempted, then reported
-            log.error("reactivate failed %s/%s", user_name, key_id, exc_info=True)
-            failed[key_id] = repr(exc)
+            logger.error("reactivate failures %s/%s", user_name, key_id, exc_info=True)
+            failures[key_id] = repr(exc)
 
-    if failed:
+    if failures:
         # The record stays, so the next attempt finds it. Clearing it would leave
         # a free disable claim on a key that is already inactive.
         raise ReactivationFailed(
-            f"{len(failed)} of {len(pairs)} access keys for {track} are still inactive: "
-            f"{failed}. The disabled record has been left in place; fix the cause and "
+            f"{len(failures)} of {len(key_pairs)} access keys for {track} are still inactive: "
+            f"{failures}. The disabled record has been left in place; fix the cause and "
             f"invoke this again.",
             reactivated=sorted(reactivated),
-            still_inactive=sorted(failed),
+            still_inactive=sorted(failures),
         )
 
-    # Not wrapped: a failed delete must not be reported as a release, or the
+    # Not wrapped: a failures delete must not be reported as a release, or the
     # track sits listed as disabled with live keys and the next runaway no-ops.
-    ledger.clear_disabled(c["usage"], track)
+    ledger.clear_disabled(aws_clients["usage"], track)
 
     caller = _caller(context)
     enforce.notify(
-        c["sns"],
-        topic,
+        aws_clients["sns"],
+        topic_arn,
         f"[Bedrock] RE-ENABLED {track}",
         {
             "track": track,
             "reactivated_access_keys": sorted(reactivated),
-            "spend_at_disable_usd": _usd(item.get("spend_at_disable", 0)),
+            "spend_at_disable_usd": _format_usd(item.get("spend_at_disable", 0)),
             "disabled_at": item.get("disabled_at"),
             "disabled_day": item.get("disabled_day"),
             "reason": reason,
             "by": caller,
         },
     )
-    log.warning("RE-ENABLED %s by %s: %s", track, caller, reason)
+    logger.warning("RE-ENABLED %s by %s: %s", track, caller, reason)
     return {
         "ok": True,
         "track": track,
@@ -142,11 +144,11 @@ def handler(event, context):
 
 def _caller(context) -> str:
     """Who invoked this, for the audit trail."""
-    ident = getattr(context, "identity", None)
-    cognito = getattr(ident, "cognito_identity_id", None)
+    lambda_identity = getattr(context, "identity", None)
+    cognito = getattr(lambda_identity, "cognito_identity_id", None)
     request_id = getattr(context, "aws_request_id", None) or "unknown"
     return cognito or f"see CloudTrail for lambda request {request_id}"
 
 
-def _usd(micros) -> str:
+def _format_usd(micros) -> str:
     return f"{Decimal(str(micros)) / Decimal(1_000_000):.4f}"

@@ -57,33 +57,33 @@ class FakeTable:
         self.fail_on = set(fail_on)
         self.calls: list[tuple[str, dict]] = []
 
-    def _k(self, key: dict) -> tuple:
-        return tuple(key.get(n) for n in self.key_names)
+    def _key_of(self, key: dict) -> tuple:
+        return tuple(key.get(name) for name in self.key_names)
 
-    def _check(self, op: str) -> None:
-        if op in self.fail_on:
+    def _raise_if_failing(self, operation: str) -> None:
+        if operation in self.fail_on:
             raise ThrottlingException()
 
     def get_item(self, Key):
         self.calls.append(("get_item", Key))
-        self._check("get_item")
-        item = self.items.get(self._k(Key))
+        self._raise_if_failing("get_item")
+        item = self.items.get(self._key_of(Key))
         return {"Item": copy.deepcopy(item)} if item else {}
 
     def put_item(self, Item, ConditionExpression=None):
         self.calls.append(("put_item", Item))
-        self._check("put_item")
-        k = self._k(Item)
+        self._raise_if_failing("put_item")
+        stored_key = self._key_of(Item)
         if ConditionExpression and "attribute_not_exists" in ConditionExpression:
-            if k in self.items:
+            if stored_key in self.items:
                 raise ConditionalCheckFailedException()
-        self.items[k] = copy.deepcopy(Item)
+        self.items[stored_key] = copy.deepcopy(Item)
         return {}
 
     def delete_item(self, Key):
         self.calls.append(("delete_item", Key))
-        self._check("delete_item")
-        self.items.pop(self._k(Key), None)
+        self._raise_if_failing("delete_item")
+        self.items.pop(self._key_of(Key), None)
         return {}
 
     def update_item(
@@ -96,25 +96,28 @@ class FakeTable:
         ReturnValues=None,
     ):
         self.calls.append(("update_item", Key))
-        self._check("update_item")
+        self._raise_if_failing("update_item")
         values = ExpressionAttributeValues or {}
         names = ExpressionAttributeNames or {}
-        k = self._k(Key)
-        existing = self.items.get(k)
+        stored_key = self._key_of(Key)
+        existing = self.items.get(stored_key)
 
         if ConditionExpression and "contains(alerted" in ConditionExpression:
-            pct = values[":pv"]
+            pct = values[":pct_value"]
             if pct in (existing or {}).get("alerted", set()):
                 raise ConditionalCheckFailedException()
 
-        set_part = UpdateExpression.split("SET", 1)[1] if "SET" in UpdateExpression else ""
+        set_clause = UpdateExpression.split("SET", 1)[1] if "SET" in UpdateExpression else ""
 
         # A nested path may only be written when its parent map already exists on
         # the stored item. DynamoDB rejects the whole request otherwise, and does
         # not create the item either -- which is exactly the behaviour this fake
         # exists to keep honest. Checked against `existing`, before any mutation.
-        for attr, name_key in (("by_model", "#model"), ("by_principal", "#princ")):
-            if f"{attr}.{name_key}" in set_part and not isinstance(
+        for attr, name_placeholder in (
+            ("by_model", "#model"),
+            ("by_principal", "#principal"),
+        ):
+            if f"{attr}.{name_placeholder}" in set_clause and not isinstance(
                 (existing or {}).get(attr), dict
             ):
                 raise ValidationException(
@@ -122,38 +125,41 @@ class FakeTable:
                     f"for update: {attr} does not exist"
                 )
 
-        item = self.items.setdefault(k, dict(Key))
+        item = self.items.setdefault(stored_key, dict(Key))
 
-        if "ADD alerted :p" in UpdateExpression:
-            item.setdefault("alerted", set()).update(values[":p"])
+        if "ADD alerted :new_pct" in UpdateExpression:
+            item.setdefault("alerted", set()).update(values[":new_pct"])
             return {}
 
         updated: dict = {}
         if "ADD" in UpdateExpression:
             # ADD <attr> :placeholder, ... -- numeric counters
-            add_part = UpdateExpression.split("ADD", 1)[1].split("SET")[0]
-            for pair in add_part.split(","):
-                bits = pair.split()
-                if len(bits) != 2:
+            add_clause = UpdateExpression.split("ADD", 1)[1].split("SET")[0]
+            for pair in add_clause.split(","):
+                parts = pair.split()
+                if len(parts) != 2:
                     continue
-                attr, placeholder = bits
+                attr, placeholder = parts
                 item[attr] = item.get(attr, 0) + values[placeholder]
                 updated[attr] = item[attr]
 
-        if set_part:
-            if "#day = :day" in set_part:
+        if set_clause:
+            if "#day = :day" in set_clause:
                 item["day"] = updated["day"] = values[":day"]
-            if "#ttl = :ttl" in set_part:
+            if "#ttl = :ttl" in set_clause:
                 item["ttl"] = updated["ttl"] = values[":ttl"]
             for attr in ("by_model", "by_principal"):
-                if f"{attr} = if_not_exists({attr}, :empty)" in set_part:
+                if f"{attr} = if_not_exists({attr}, :empty)" in set_clause:
                     item.setdefault(attr, {})
-            for attr, name_key in (("by_model", "#model"), ("by_principal", "#princ")):
-                if f"{attr}.{name_key}" in set_part:
-                    bucket = item[attr]
-                    field = names[name_key]
-                    bucket[field] = bucket.get(field, 0) + values[":m"]
-                    updated[attr] = copy.deepcopy(bucket)
+            for attr, name_placeholder in (
+                ("by_model", "#model"),
+                ("by_principal", "#principal"),
+            ):
+                if f"{attr}.{name_placeholder}" in set_clause:
+                    breakdown = item[attr]
+                    field_name = names[name_placeholder]
+                    breakdown[field_name] = breakdown.get(field_name, 0) + values[":micros"]
+                    updated[attr] = copy.deepcopy(breakdown)
 
         if ReturnValues == "UPDATED_NEW":
             return {"Attributes": copy.deepcopy(updated)}
@@ -184,7 +190,12 @@ class FakeIAM:
         self.tag_calls += 1
         if self.fail_tags:
             raise ThrottlingException()
-        return {"Tags": [{"Key": k, "Value": v} for k, v in self.tags.get(name, {}).items()]}
+        return {
+            "Tags": [
+                {"Key": key, "Value": value}
+                for key, value in self.tags.get(name, {}).items()
+            ]
+        }
 
     def list_user_tags(self, UserName):
         return self._tags_for(UserName)
@@ -197,17 +208,20 @@ class FakeIAM:
             raise ThrottlingException()
         return {
             "AccessKeyMetadata": [
-                {"AccessKeyId": kid, "Status": status}
-                for kid, status in self._keys_of(UserName)
+                {"AccessKeyId": key_id, "Status": status}
+                for key_id, status in self._keys_of(UserName)
             ]
         }
 
     def _keys_of(self, user_name):
         """Status reflects what has already been deactivated, like IAM does."""
-        raw = self.access_keys.get(user_name, [])
-        off = {kid for user, kid in self.deactivated if user == user_name}
-        on = {kid for user, kid in self.activated if user == user_name}
-        return [(kid, "Inactive" if kid in off - on else "Active") for kid in raw]
+        key_ids = self.access_keys.get(user_name, [])
+        inactive_ids = {key_id for user, key_id in self.deactivated if user == user_name}
+        reactivated_ids = {key_id for user, key_id in self.activated if user == user_name}
+        return [
+            (key_id, "Inactive" if key_id in inactive_ids - reactivated_ids else "Active")
+            for key_id in key_ids
+        ]
 
     def update_access_key(self, UserName, AccessKeyId, Status):
         if AccessKeyId in self.fail_update:

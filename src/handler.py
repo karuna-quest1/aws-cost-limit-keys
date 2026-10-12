@@ -21,8 +21,8 @@ import identity
 import ledger
 import pricing
 
-log = logging.getLogger()
-log.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
+logger = logging.getLogger()
+logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
 USAGE_TABLE = os.environ.get("USAGE_TABLE", "bedrock_usage")
 BUDGET_TABLE = os.environ.get("BUDGET_TABLE", "bedrock_budgets")
@@ -42,10 +42,10 @@ def clients():
         from botocore.config import Config
 
         config = Config(retries={"max_attempts": 5, "mode": "adaptive"})
-        ddb = boto3.resource("dynamodb", config=config)
+        dynamodb = boto3.resource("dynamodb", config=config)
         _clients.update(
-            usage=ddb.Table(USAGE_TABLE),
-            budgets=ddb.Table(BUDGET_TABLE),
+            usage=dynamodb.Table(USAGE_TABLE),
+            budgets=dynamodb.Table(BUDGET_TABLE),
             iam=boto3.client("iam", config=config),
             sns=boto3.client("sns", config=config),
         )
@@ -54,51 +54,57 @@ def clients():
 
 def unpack(event: dict) -> list[str]:
     """base64(gzip(json)) -> the raw `message` strings, unparsed."""
-    blob = event.get("awslogs", {}).get("data")
-    if not blob:
+    encoded_payload = event.get("awslogs", {}).get("data")
+    if not encoded_payload:
         return []
-    payload = json.loads(gzip.decompress(base64.b64decode(blob)))
+    payload = json.loads(gzip.decompress(base64.b64decode(encoded_payload)))
     if payload.get("messageType") == "CONTROL_MESSAGE":
         return []  # subscription-filter health check, carries no invocations
-    return [raw["message"] for raw in payload.get("logEvents", []) if "message" in raw]
+    return [
+        log_event["message"]
+        for log_event in payload.get("logEvents", [])
+        if "message" in log_event
+    ]
 
 
 def handler(event, context):  # noqa: ARG001 - context unused, signature is fixed
     stats = {"seen": 0, "counted": 0, "duplicate": 0, "failed": 0}
     failures: list[tuple[str, Exception]] = []
 
-    c = clients()
-    for raw in unpack(event):
+    aws_clients = clients()
+    for message in unpack(event):
         stats["seen"] += 1
         try:
-            stats[process(raw, c)] += 1
+            stats[process_log_entry(message, aws_clients)] += 1
         except Exception as exc:  # noqa: BLE001 - re-raised below, after the loop
             stats["failed"] += 1
-            failures.append((_request_id_of(raw), exc))
-            log.exception("failed on %s", _request_id_of(raw))
+            failures.append((_request_id_of(message), exc))
+            logger.exception("failed on %s", _request_id_of(message))
 
-    log.info("batch %s", stats)
+    logger.info("batch %s", stats)
     if failures:
         raise errors.BatchIncomplete(stats, failures)
     return stats
 
 
-def _request_id_of(raw: str) -> str:
+def _request_id_of(message: str) -> str:
     """Best effort, for the log line only. Never raises."""
     try:
-        return str(json.loads(raw).get("requestId", "<no requestId>"))
+        return str(json.loads(message).get("requestId", "<no requestId>"))
     except Exception:  # noqa: BLE001 - this is the diagnostic path
         return "<unparseable>"
 
 
-def process(raw: str, c: dict) -> str:
+def process_log_entry(message: str, aws_clients: dict) -> str:
     """One invocation log line. Returns the stats key it belongs to."""
     try:
-        entry = json.loads(raw)
+        entry = json.loads(message)
     except ValueError as exc:
         raise errors.MalformedLogEntry(f"log event message is not JSON: {exc}") from exc
     if not isinstance(entry, dict):
-        raise errors.MalformedLogEntry(f"log event message is not an object: {type(entry).__name__}")
+        raise errors.MalformedLogEntry(
+            f"log event message is not an object: {type(entry).__name__}"
+        )
 
     request_id = (entry.get("requestId") or "").strip()
     if not request_id:
@@ -110,50 +116,65 @@ def process(raw: str, c: dict) -> str:
         raise errors.MalformedLogEntry(f"log entry {request_id} has no modelId")
 
     arn = (entry.get("identity") or {}).get("arn", "")
-    who = identity.resolve(arn, c["iam"], c["usage"])
+    attribution = identity.resolve(arn, aws_clients["iam"], aws_clients["usage"])
     usage = pricing.usage_from_log(entry)
-    priced = pricing.price(usage, model_id, entry.get("region"))
+    priced_usage = pricing.price(usage, model_id, entry.get("region"))
     day = ledger.utc_day()
 
-    if ledger.claim_count(c["usage"], request_id):
+    if ledger.claim_count(aws_clients["usage"], request_id):
         total = ledger.accumulate(
-            c["usage"],
-            track=who.track,
+            aws_clients["usage"],
+            track=attribution.track,
             day=day,
             model_id=model_id,
-            principal_name=who.principal.name,
+            principal_name=attribution.principal.name,
             usage=usage,
-            micros=priced.micros,
+            micros=priced_usage.micros,
         )
         outcome = "counted"
     else:
         # Already counted, by an earlier delivery or a concurrent invocation.
         # The money must not be added twice, but whoever counted it may have died
         # before alerting or disabling -- and every claim below is idempotent.
-        total = ledger.current_total(c["usage"], who.track, day)
+        total = ledger.current_total(aws_clients["usage"], attribution.track, day)
         outcome = "duplicate"
 
-    react(who, day, total, c, model_id=model_id, fallback=priced.is_fallback)
+    apply_budget_policy(
+        attribution,
+        day,
+        total,
+        aws_clients,
+        model_id=model_id,
+        fallback=priced_usage.is_fallback,
+    )
     return outcome
 
 
-def react(who, day: str, total: int, c: dict, *, model_id: str, fallback: bool) -> None:
-    budget = budgets.load(c["budgets"], who.track)
-    topic = budget.notify_topic_arn or NOTIFY_TOPIC_ARN
+def apply_budget_policy(
+    attribution,
+    day: str,
+    total: int,
+    aws_clients: dict,
+    *,
+    model_id: str,
+    fallback: bool,
+) -> None:
+    budget = budgets.load(aws_clients["budgets"], attribution.track)
+    topic_arn = budget.notify_topic_arn or NOTIFY_TOPIC_ARN
     decision = enforce.evaluate(total, budget)
 
     if budget.is_floor:
-        _notice_once(
-            c,
-            topic,
-            track=who.track,
+        _send_notice_once(
+            aws_clients,
+            topic_arn,
+            track=attribution.track,
             day=day,
             kind="NO_BUDGET",
-            subject=f"[Bedrock] {who.track} has no budget row",
+            subject=f"[Bedrock] {attribution.track} has no budget row",
             body={
-                "track": who.track,
-                "owner": who.owner,
-                "applied_daily_usd": _usd(budget.daily_micros),
+                "track": attribution.track,
+                "owner": attribution.owner,
+                "applied_daily_usd": _format_usd(budget.daily_micros),
                 "action": (
                     "A conservative floor is being applied so the track is not "
                     "unlimited. Seed a TRACK# row, or DEFAULT, to set a real budget."
@@ -162,90 +183,99 @@ def react(who, day: str, total: int, c: dict, *, model_id: str, fallback: bool) 
         )
 
     if fallback:
-        _notice_once(
-            c,
-            topic,
-            track=who.track,
+        _send_notice_once(
+            aws_clients,
+            topic_arn,
+            track=attribution.track,
             day=day,
             kind=f"FALLBACK#{model_id}",
-            subject=f"[Bedrock] unpriced model used by {who.track}",
+            subject=f"[Bedrock] unpriced model used by {attribution.track}",
             body={
-                "track": who.track,
+                "track": attribution.track,
                 "model_id": model_id,
                 "action": "charged at the fallback rate; add it to the rate card",
             },
         )
 
-    for pct in decision.crossed:
-        if not ledger.claim_threshold(c["usage"], who.track, day, pct):
+    for threshold_pct in decision.crossed_pcts:
+        if not ledger.claim_threshold(
+            aws_clients["usage"], attribution.track, day, threshold_pct
+        ):
             continue  # another invocation already sent this one today
         enforce.notify(
-            c["sns"],
-            topic,
-            f"[Bedrock] {who.track} at {pct}% of daily budget",
+            aws_clients["sns"],
+            topic_arn,
+            f"[Bedrock] {attribution.track} at {threshold_pct}% of daily budget",
             {
-                "track": who.track,
-                "owner": who.owner,
-                "env": who.env,
+                "track": attribution.track,
+                "owner": attribution.owner,
+                "env": attribution.env,
                 "day": day,
-                "threshold_pct": pct,
+                "threshold_pct": threshold_pct,
                 # The gap between the threshold and the real figure is the
                 # signal: 81% is a nudge, 140% means the disable is next.
-                "actual_pct": f"{decision.pct:.1f}",
-                "spent_usd": _usd(total),
-                "daily_budget_usd": _usd(budget.daily_micros),
-                "disable_at_usd": _usd(budget.runaway_micros),
+                "actual_pct": f"{decision.pct_of_budget:.1f}",
+                "spent_usd": _format_usd(total),
+                "daily_budget_usd": _format_usd(budget.daily_micros),
+                "disable_at_usd": _format_usd(budget.runaway_micros),
                 "budget_scope": budget.scope,
                 "enforce": budget.enforce,
                 "note": "Bedrock access is deactivated above the disable threshold.",
             },
         )
 
-    if not decision.runaway:
+    if not decision.is_runaway:
         return
     if not budget.enforce:
         # The watch-only week in one line: what would have happened, with the
         # real number, without doing it.
-        log.warning(
+        logger.warning(
             "%s past the disable ceiling at %s USD (ceiling %s), but enforce=false",
-            who.track,
-            _usd(total),
-            _usd(budget.runaway_micros),
+            attribution.track,
+            _format_usd(total),
+            _format_usd(budget.runaway_micros),
         )
         return
-    disable(who, day, total, budget, topic, c)
+    disable_track(attribution, day, total, budget, topic_arn, aws_clients)
 
 
-def disable(who, day: str, total: int, budget, topic: str | None, c: dict) -> None:
-    principal = who.principal
+def disable_track(
+    attribution,
+    day: str,
+    total: int,
+    budget,
+    topic_arn: str | None,
+    aws_clients: dict,
+) -> None:
+    principal = attribution.principal
     # Raises on failure: an empty set would be indistinguishable from "no keys".
-    key_ids = enforce.access_keys_for(c["iam"], principal)
+    key_ids = enforce.access_keys_for(aws_clients["iam"], principal)
 
     if not key_ids:
         # A role, or keys already inactive. Claiming here would record the track
         # as stopped while it kept spending, and the claim is one-shot.
-        log.error(
+        logger.error(
             "%s is past the disable ceiling at %s USD but has no active access key to "
             "deactivate (principal %s, kind %s)",
-            who.track,
-            _usd(total),
+            attribution.track,
+            _format_usd(total),
             principal.name,
             principal.kind,
         )
-        _notice_once(
-            c,
-            topic,
-            track=who.track,
+        _send_notice_once(
+            aws_clients,
+            topic_arn,
+            track=attribution.track,
             day=day,
             kind="UNENFORCEABLE",
-            subject=f"[Bedrock] cannot stop {who.track} - no access key",
+            subject=f"[Bedrock] cannot stop {attribution.track} - no access key",
             body={
-                "track": who.track,
-                "owner": who.owner,
+                "track": attribution.track,
+                "owner": attribution.owner,
                 "principal": principal.name,
                 "principal_kind": principal.kind,
-                "spent_usd": _usd(total),
-                "ceiling_usd": _usd(budget.runaway_micros),
+                "spent_usd": _format_usd(total),
+                "ceiling_usd": _format_usd(budget.runaway_micros),
                 "action": (
                     "Enforcement works by deactivating a long-lived access key. "
                     "A role-based caller has none. Stop the workload directly, or "
@@ -258,8 +288,8 @@ def disable(who, day: str, total: int, budget, topic: str | None, c: dict) -> No
     # Claimed before the IAM call, so concurrent invocations cannot each
     # deactivate and each page.
     if not ledger.claim_disable(
-        c["usage"],
-        track=who.track,
+        aws_clients["usage"],
+        track=attribution.track,
         day=day,
         principal_keys={principal.name: key_ids},
         spent_micros=total,
@@ -267,54 +297,65 @@ def disable(who, day: str, total: int, budget, topic: str | None, c: dict) -> No
         return
 
     try:
-        done = enforce.deactivate_keys(c["iam"], principal.name, key_ids)
+        deactivated_key_ids = enforce.deactivate_keys(
+            aws_clients["iam"], principal.name, key_ids
+        )
     except errors.DeactivationFailed as exc:
         if not exc.deactivated:
             # Nothing switched off, so the claim is a lie. A track over its
             # ceiling keeps producing lines, so the retry is seconds away.
-            ledger.release_disable(c["usage"], who.track)
+            ledger.release_disable(aws_clients["usage"], attribution.track)
         else:
             # Partly done, so the claim is now an accurate record. Nothing
             # finishes the remaining keys automatically -- a human reads
             # still_active off the page.
-            log.error(
+            logger.error(
                 "partial deactivation for %s: inactive=%s still active=%s",
-                who.track,
+                attribution.track,
                 exc.deactivated,
                 exc.still_active,
             )
         raise
 
     enforce.notify(
-        c["sns"],
-        topic,
-        f"[Bedrock] DISABLED {who.track} - runaway spend",
+        aws_clients["sns"],
+        topic_arn,
+        f"[Bedrock] DISABLED {attribution.track} - runaway spend",
         {
-            "track": who.track,
-            "owner": who.owner,
-            "env": who.env,
+            "track": attribution.track,
+            "owner": attribution.owner,
+            "env": attribution.env,
             "day": day,
-            "spent_usd": _usd(total),
-            "daily_budget_usd": _usd(budget.daily_micros),
-            "ceiling_usd": _usd(budget.runaway_micros),
+            "spent_usd": _format_usd(total),
+            "daily_budget_usd": _format_usd(budget.daily_micros),
+            "ceiling_usd": _format_usd(budget.runaway_micros),
             "principal": principal.name,
-            "deactivated_access_keys": sorted(done),
+            "deactivated_access_keys": sorted(deactivated_key_ids),
             "release": (
                 "Does not reactivate on its own. On-call rota re-enables via the "
-                "bedrock-guardrail-unblock function, after confirming what spent "
+                "bedrock-cost-limits-unblock function, after confirming what spent "
                 "the money and that it has stopped."
             ),
         },
     )
-    log.error("DISABLED %s after %s USD", who.track, _usd(total))
+    logger.error("DISABLED %s after %s USD", attribution.track, _format_usd(total))
 
 
-def _notice_once(c: dict, topic: str | None, *, track: str, day: str, kind: str, subject, body):
+def _send_notice_once(
+    aws_clients: dict,
+    topic_arn: str | None,
+    *,
+    track: str,
+    day: str,
+    kind: str,
+    subject,
+    body,
+):
     """At most once per track per day."""
-    if not ledger.claim_notice(c["usage"], track, day, kind):
+    if not ledger.claim_notice(aws_clients["usage"], track, day, kind):
         return
-    enforce.notify(c["sns"], topic, subject, body)
+    enforce.notify(aws_clients["sns"], topic_arn, subject, body)
 
 
-def _usd(micros: int) -> str:
+def _format_usd(micros: int) -> str:
     return f"{Decimal(micros) / Decimal(1_000_000):.4f}"

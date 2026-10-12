@@ -17,7 +17,7 @@ from errors import (
     is_validation_error,
 )
 
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "utc_day",
@@ -38,12 +38,14 @@ _ROW_TTL_SECONDS = 60 * 24 * 60 * 60  # 60 days of history, then self-delete
 _DEDUP_TTL_SECONDS = 48 * 60 * 60
 
 
-def utc_day(ts: float | None = None) -> str:
+def utc_day(timestamp: float | None = None) -> str:
     """The budget day, always UTC. In the sort key, which is the daily reset."""
     # UTC midnight is 05:30 IST, outside the working day, so the budget never
-    # refills mid-afternoon. ts=0 is honoured; only None means "now".
+    # refills mid-afternoon. timestamp=0 is honoured; only None means "now".
     moment = (
-        datetime.now(timezone.utc) if ts is None else datetime.fromtimestamp(ts, tz=timezone.utc)
+        datetime.now(timezone.utc)
+        if timestamp is None
+        else datetime.fromtimestamp(timestamp, tz=timezone.utc)
     )
     return moment.strftime("%Y-%m-%d")
 
@@ -61,7 +63,7 @@ def claim_count(table, request_id: str, now: float | None = None) -> bool:
     """True if this caller should add this invocation to the ledger."""
     # It does not read to check: that leaves a window where two invocations both
     # see nothing and both count. The write and the decision are one action.
-    # Guards the money only -- a loser must still react, see handler.process.
+    # Guards the money only -- a loser must still react, see handler.process_log_entry.
     now = time.time() if now is None else now
     try:
         table.put_item(
@@ -84,11 +86,12 @@ def claim_count(table, request_id: str, now: float | None = None) -> bool:
 # ---------------------------------------------------------------------------
 
 _ACCUMULATE_EXPRESSION = (
-    "ADD spent_micros :m, in_tokens :i, out_tokens :o, "
-    "cache_read_tokens :cr, cache_write_tokens :cw, calls :one "
+    "ADD spent_micros :micros, in_tokens :input_tokens, out_tokens :output_tokens, "
+    "cache_read_tokens :cache_read_tokens, cache_write_tokens :cache_write_tokens, "
+    "calls :one_call "
     "SET #day = :day, #ttl = :ttl, "
-    "by_model.#model = if_not_exists(by_model.#model, :zero) + :m, "
-    "by_principal.#princ = if_not_exists(by_principal.#princ, :zero) + :m"
+    "by_model.#model = if_not_exists(by_model.#model, :zero) + :micros, "
+    "by_principal.#principal = if_not_exists(by_principal.#principal, :zero) + :micros"
 )
 
 
@@ -128,22 +131,22 @@ def accumulate(
     # contains dots, which an expression would read as a nested path.
     now = time.time() if now is None else now
     key = day_key(track, day)
-    args = dict(
+    update_args = dict(
         Key=key,
         UpdateExpression=_ACCUMULATE_EXPRESSION,
         ExpressionAttributeNames={
             "#day": "day",
             "#ttl": "ttl",
             "#model": model_id,
-            "#princ": principal_name,
+            "#principal": principal_name,
         },
         ExpressionAttributeValues={
-            ":m": micros,
-            ":i": usage.input_tokens,
-            ":o": usage.output_tokens,
-            ":cr": usage.cache_read_tokens,
-            ":cw": usage.cache_write_tokens,
-            ":one": 1,
+            ":micros": micros,
+            ":input_tokens": usage.input_tokens,
+            ":output_tokens": usage.output_tokens,
+            ":cache_read_tokens": usage.cache_read_tokens,
+            ":cache_write_tokens": usage.cache_write_tokens,
+            ":one_call": 1,
             ":zero": 0,
             ":day": day,
             ":ttl": int(now) + _ROW_TTL_SECONDS,
@@ -152,21 +155,21 @@ def accumulate(
     )
 
     try:
-        resp = table.update_item(**args)
+        response = table.update_item(**update_args)
     except Exception as exc:
         if not is_validation_error(exc):
             raise LedgerWriteFailed(f"accumulate failed for {key}: {exc!r}") from exc
         # First write of the day: the parent maps do not exist yet.
         _ensure_maps(table, key)
         try:
-            resp = table.update_item(**args)
+            response = table.update_item(**update_args)
         except Exception as retry_exc:
             raise LedgerWriteFailed(
                 f"accumulate failed for {key} even after initialising the day row: "
                 f"{retry_exc!r}"
             ) from retry_exc
 
-    attributes = resp.get("Attributes") or {}
+    attributes = response.get("Attributes") or {}
     if "spent_micros" not in attributes:
         # UPDATED_NEW always returns an ADDed attribute. Guessing instead would
         # hand enforcement a number that is too small.
@@ -198,9 +201,11 @@ def claim_threshold(table, track: str, day: str, pct: int) -> bool:
     try:
         table.update_item(
             Key=day_key(track, day),
-            UpdateExpression="ADD alerted :p",
-            ConditionExpression="attribute_not_exists(alerted) OR NOT contains(alerted, :pv)",
-            ExpressionAttributeValues={":p": {pct}, ":pv": pct},
+            UpdateExpression="ADD alerted :new_pct",
+            ConditionExpression=(
+                "attribute_not_exists(alerted) OR NOT contains(alerted, :pct_value)"
+            ),
+            ExpressionAttributeValues={":new_pct": {pct}, ":pct_value": pct},
         )
         return True
     except Exception as exc:
@@ -245,7 +250,9 @@ def claim_disable(
     now = time.time() if now is None else now
     # Pre-paired: two independent sets lose which key belongs to which user, and
     # the cross product calls UpdateAccessKey with mismatched owners.
-    pairs = {f"{user}/{key_id}" for user, keys in principal_keys.items() for key_id in keys}
+    principal_key_pairs = {
+        f"{user}/{key_id}" for user, keys in principal_keys.items() for key_id in keys
+    }
     item = {
         "pk": f"TRACK#{track}",
         "sk": "DISABLED",
@@ -260,8 +267,8 @@ def claim_disable(
     }
     if principal_keys:
         item["principals"] = set(principal_keys)
-    if pairs:
-        item["keys"] = pairs
+    if principal_key_pairs:
+        item["keys"] = principal_key_pairs
     try:
         table.put_item(Item=item, ConditionExpression="attribute_not_exists(pk)")
         return True

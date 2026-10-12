@@ -13,7 +13,7 @@ from typing import NamedTuple
 
 from errors import AttributionUnavailable, UntaggedPrincipal
 
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 __all__ = ["Principal", "Attribution", "parse_arn", "resolve", "reset_cache", "TRACK_TAG"]
 
@@ -32,7 +32,7 @@ _NEGATIVE_TTL_SECONDS = 60
 # arn:aws:iam::123456789012:role/ShinroRunner
 _ARN = re.compile(
     r"^arn:aws[a-z-]*:(?:iam|sts)::(?P<account>\d{12}):"
-    r"(?P<kind>user|role|assumed-role)/(?P<rest>.+)$"
+    r"(?P<kind>user|role|assumed-role)/(?P<path>.+)$"
 )
 
 
@@ -50,29 +50,29 @@ class Attribution(NamedTuple):
 
 
 # arn -> (expires_at_epoch, Attribution)
-_memo: dict[str, tuple[float, Attribution]] = {}
+_memo_cache: dict[str, tuple[float, Attribution]] = {}
 # arn -> expires_at_epoch, for principals known to be untagged
-_negative: dict[str, float] = {}
+_untagged_cache: dict[str, float] = {}
 
 
 def parse_arn(arn: str) -> Principal | None:
     """The IAM principal whose tags to read. None if the shape is unrecognised."""
-    m = _ARN.match((arn or "").strip())
-    if not m:
+    match = _ARN.match((arn or "").strip())
+    if not match:
         return None
-    kind, rest = m.group("kind"), m.group("rest")
+    kind, path = match.group("kind"), match.group("path")
     # The session name is per-session and meaningless for attribution.
     if kind == "assumed-role":
-        return Principal("role", rest.split("/", 1)[0], arn)
-    return Principal(kind, rest.rsplit("/", 1)[-1], arn)
+        return Principal("role", path.split("/", 1)[0], arn)
+    return Principal(kind, path.rsplit("/", 1)[-1], arn)
 
 
 def _tags_from_iam(iam, principal: Principal) -> dict[str, str]:
     if principal.kind == "user":
-        resp = iam.list_user_tags(UserName=principal.name)
+        response = iam.list_user_tags(UserName=principal.name)
     else:
-        resp = iam.list_role_tags(RoleName=principal.name)
-    return {t["Key"]: t["Value"] for t in resp.get("Tags", [])}
+        response = iam.list_role_tags(RoleName=principal.name)
+    return {tag["Key"]: tag["Value"] for tag in response.get("Tags", [])}
 
 
 def _from_tags(tags: dict[str, str], principal: Principal) -> Attribution:
@@ -104,7 +104,7 @@ def _read_item_cache(table, arn: str) -> Attribution | None:
     if principal is None or not track:
         # Older schema or a partial write -- re-read IAM rather than trust half
         # a cache entry. This is also what ages out pre-`track` rows.
-        log.warning("discarding unusable tag cache row for %s", arn)
+        logger.warning("discarding unusable tag cache row for %s", arn)
         return None
     return Attribution(
         track=track,
@@ -114,14 +114,14 @@ def _read_item_cache(table, arn: str) -> Attribution | None:
     )
 
 
-def _write_item_cache(table, arn: str, a: Attribution, now: float) -> None:
+def _write_item_cache(table, arn: str, attribution: Attribution, now: float) -> None:
     item = {
         "pk": f"ARN#{arn}",
         "sk": "TAGS",
-        "track": a.track,
+        "track": attribution.track,
         "ttl": int(now) + _ITEM_TTL_SECONDS,
     }
-    for key, value in (("owner", a.owner), ("env", a.env)):
+    for key, value in (("owner", attribution.owner), ("env", attribution.env)):
         if value:
             item[key] = value
     try:
@@ -134,12 +134,12 @@ def resolve(arn: str, iam, table, now: float | None = None) -> Attribution:
     """Raises AttributionUnavailable (transient) or UntaggedPrincipal (permanent)."""
     now = time.time() if now is None else now
 
-    cached = _memo.get(arn)
-    if cached and cached[0] > now:
-        return cached[1]
+    memoized = _memo_cache.get(arn)
+    if memoized and memoized[0] > now:
+        return memoized[1]
 
-    negative_until = _negative.get(arn)
-    if negative_until and negative_until > now:
+    untagged_until = _untagged_cache.get(arn)
+    if untagged_until and untagged_until > now:
         raise UntaggedPrincipal(
             f"{arn} has no {TRACK_TAG} tag (cached for up to "
             f"{_NEGATIVE_TTL_SECONDS}s to avoid throttling IAM)"
@@ -151,10 +151,10 @@ def resolve(arn: str, iam, table, now: float | None = None) -> Attribution:
             f"identity arn is not a shape this can read tags from: {arn!r}"
         )
 
-    from_item = _read_item_cache(table, arn)
-    if from_item is not None:
-        _memo[arn] = (now + _MEMO_TTL_SECONDS, from_item)
-        return from_item
+    cached_attribution = _read_item_cache(table, arn)
+    if cached_attribution is not None:
+        _memo_cache[arn] = (now + _MEMO_TTL_SECONDS, cached_attribution)
+        return cached_attribution
 
     try:
         tags = _tags_from_iam(iam, principal)
@@ -166,15 +166,15 @@ def resolve(arn: str, iam, table, now: float | None = None) -> Attribution:
     try:
         attribution = _from_tags(tags, principal)
     except UntaggedPrincipal:
-        _negative[arn] = now + _NEGATIVE_TTL_SECONDS
+        _untagged_cache[arn] = now + _NEGATIVE_TTL_SECONDS
         raise
 
-    _memo[arn] = (now + _MEMO_TTL_SECONDS, attribution)
+    _memo_cache[arn] = (now + _MEMO_TTL_SECONDS, attribution)
     _write_item_cache(table, arn, attribution, now)
     return attribution
 
 
 def reset_cache() -> None:
     """Drop the in-process caches. For tests, and for a forced re-read."""
-    _memo.clear()
-    _negative.clear()
+    _memo_cache.clear()
+    _untagged_cache.clear()

@@ -65,7 +65,7 @@ You will be asked for these. The ones that matter are in bold.
 
 | Prompt | Enter | Notes |
 | --- | --- | --- |
-| Stack Name | `bedrock-guardrail` | any name; it groups everything |
+| Stack Name | `bedrock-cost-limits` | any name; it groups everything |
 | AWS Region | `us-east-1` | **the region your tracks call Bedrock in** |
 | **`BedrockLogGroupName`** | press Enter for `/aws/bedrock/modelinvocations` | you create this in step 5 |
 | **`PrincipalNamePattern`** | e.g. `BedrockDev-*` | **the IAM users this may touch** — see below |
@@ -84,19 +84,19 @@ This creates nine things:
 ```
 bedrock_usage                       DynamoDB table (+ one index, + auto-expiry)
 bedrock_budgets                     DynamoDB table
-bedrock-guardrail-alerts            SNS topic
+bedrock-cost-limits-alerts            SNS topic
   └─ your email                     SNS subscription (if you gave one)
-bedrock-guardrail-meter-dlq         SQS queue, for batches that fail
-bedrock-guardrail-meter             Lambda — the meter
-bedrock-guardrail-unblock           Lambda — the release
-bedrock-guardrail-meter-errors      CloudWatch alarm
-bedrock-guardrail-meter-dlq-not-empty   CloudWatch alarm
+bedrock-cost-limits-meter-dlq         SQS queue, for batches that fail
+bedrock-cost-limits-meter             Lambda — the meter
+bedrock-cost-limits-unblock           Lambda — the release
+bedrock-cost-limits-meter-errors      CloudWatch alarm
+bedrock-cost-limits-meter-dlq-not-empty   CloudWatch alarm
 ```
 
 Note the values you will need later:
 
 ```bash
-aws cloudformation describe-stacks --stack-name bedrock-guardrail \
+aws cloudformation describe-stacks --stack-name bedrock-cost-limits \
   --query 'Stacks[0].Outputs' --output table
 ```
 
@@ -109,7 +109,7 @@ system sends goes nowhere, silently.
 Check:
 
 ```bash
-TOPIC=$(aws cloudformation describe-stacks --stack-name bedrock-guardrail \
+TOPIC=$(aws cloudformation describe-stacks --stack-name bedrock-cost-limits \
   --query 'Stacks[0].Outputs[?OutputKey==`AlertTopicArn`].OutputValue' --output text)
 
 aws sns list-subscriptions-by-topic --topic-arn "$TOPIC" \
@@ -249,11 +249,11 @@ hardcoded $10 floor and sends you a daily "no budget row" warning.
 
 ```bash
 # the DEFAULT row — every track inherits whatever it does not set itself
-make seed DAILY=25
+make seed DAILY_USD=25
 
 # one row per track
-make seed-track TRACK=camunda_to_temporal DAILY=50
-make seed-track TRACK=memcached_to_elasticache DAILY=30
+make seed-track TRACK=camunda_to_temporal DAILY_USD=50
+make seed-track TRACK=memcached_to_elasticache DAILY_USD=30
 ```
 
 Both write `enforce: false`. See [the budget table](#bedrock_budgets) below for
@@ -284,7 +284,7 @@ Three things to watch:
 
 ```bash
 # is the DLQ empty?
-DLQ=$(aws cloudformation describe-stacks --stack-name bedrock-guardrail \
+DLQ=$(aws cloudformation describe-stacks --stack-name bedrock-cost-limits \
   --query 'Stacks[0].Outputs[?OutputKey==`MeterDeadLetterQueueUrl`].OutputValue' --output text)
 aws sqs get-queue-attributes --queue-url "$DLQ" \
   --attribute-names ApproximateNumberOfMessagesVisible
@@ -500,8 +500,8 @@ what `make status` queries — one lookup, no table scan.
 | `Track` tag per IAM user | `aws iam tag-user` | step 4 |
 | log group name | `sam deploy` prompt + step 5 must match | steps 2 and 5 |
 | the logging role | `aws iam create-role` | step 5 |
-| `DEFAULT` budget | `make seed DAILY=25` | step 7 |
-| a track's budget | `make seed-track TRACK=... DAILY=...` | step 7 |
+| `DEFAULT` budget | `make seed DAILY_USD=25` | step 7 |
+| a track's budget | `make seed-track TRACK=... DAILY_USD=...` | step 7 |
 | enforcement on/off | `make enforce` / `make watch` | step 9 |
 
 Everything except the tags and the budget rows is set once at deploy.
@@ -510,7 +510,7 @@ Everything except the tags and the budget rows is set once at deploy.
 
 ## Alerts: what is sent, and where
 
-Everything goes to **one SNS topic**, `bedrock-guardrail-alerts`, and from there
+Everything goes to **one SNS topic**, `bedrock-cost-limits-alerts`, and from there
 to whoever is subscribed to it. One email address subscribed means one inbox
 receives all of this.
 
@@ -523,8 +523,8 @@ receives all of this.
 | `<track> has no budget row` | the $10 floor was applied | once per day | track's, else default |
 | `unpriced model used by <track>` | that model is not in the price list | once per day **per model** | track's, else default |
 | `cannot stop <track> — no access key` | past the ceiling, nothing to deactivate | once per day | track's, else default |
-| **`bedrock-guardrail-meter-errors`** | the meter itself failed | per 5-minute window | **always the default** |
-| **`bedrock-guardrail-meter-dlq-not-empty`** | a batch gave up after retries | per 5-minute window | **always the default** |
+| **`bedrock-cost-limits-meter-errors`** | the meter itself failed | per 5-minute window | **always the default** |
+| **`bedrock-cost-limits-meter-dlq-not-empty`** | a batch gave up after retries | per 5-minute window | **always the default** |
 
 "track's, else default" means: the track's budget row can name its own topic, and
 if it does not, the stack's topic is used. **Right now no row should name one**
@@ -578,7 +578,7 @@ Three fields worth knowing:
   "principal": "BedrockDev-camunda-to-temporal",
   "deactivated_access_keys": ["AKIAEXAMPLE1", "AKIAEXAMPLE2"],
   "release": "Does not reactivate on its own. On-call rota re-enables via the
-              bedrock-guardrail-unblock function, after confirming what spent
+              bedrock-cost-limits-unblock function, after confirming what spent
               the money and that it has stopped."
 }
 ```
@@ -593,7 +593,7 @@ The runbook is in the alert, so nobody has to go looking for it at 9pm.
 make status                                   # today's spend, every track
 make status DAY=2026-10-07                    # a past day
 
-make seed-track TRACK=<name> DAILY=<n>        # add or reset a track's budget
+make seed-track TRACK=<name> DAILY_USD=<n>        # add or reset a track's budget
 make enforce TRACK=<name>                     # arm enforcement for one track
 make watch   TRACK=<name>                     # disarm it
 
@@ -636,7 +636,7 @@ make unblock TRACK=camunda_to_temporal REASON='wave-7f3a21 loop fixed, retry cap
 > ceiling, so if the cause has not actually stopped, the next Bedrock call
 > switches the keys straight back off. If you genuinely need headroom for the
 > rest of the day, raise the budget instead:
-> `make seed-track TRACK=camunda_to_temporal DAILY=100`
+> `make seed-track TRACK=camunda_to_temporal DAILY_USD=100`
 
 ---
 
@@ -657,7 +657,7 @@ make unblock TRACK=camunda_to_temporal REASON='wave-7f3a21 loop fixed, retry cap
 ### Is the meter actually running?
 
 ```bash
-aws logs tail /aws/lambda/bedrock-guardrail-meter --follow
+aws logs tail /aws/lambda/bedrock-cost-limits-meter --follow
 ```
 
 A healthy batch logs one line:
@@ -691,7 +691,7 @@ so enforcement cannot bite. You get a distinct alert saying exactly that.
 ## Removing it
 
 ```bash
-aws cloudformation delete-stack --stack-name bedrock-guardrail
+aws cloudformation delete-stack --stack-name bedrock-cost-limits
 ```
 
 Deletes everything the stack made. **Not** deleted, because the stack did not

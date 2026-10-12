@@ -18,7 +18,7 @@ from errors import (
     KeyLookupFailed,
 )
 
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 __all__ = ["Decision", "evaluate", "notify", "deactivate_keys", "access_keys_for"]
 
@@ -26,9 +26,9 @@ _SNS_SUBJECT_LIMIT = 100
 
 
 class Decision(NamedTuple):
-    crossed: tuple[int, ...]  # alert thresholds newly reached, ascending
-    runaway: bool  # spend is past the deactivation ceiling
-    pct: Decimal  # how far through the daily budget, for the alert body
+    crossed_pcts: tuple[int, ...]  # alert thresholds newly reached, ascending
+    is_runaway: bool  # spend is past the deactivation ceiling
+    pct_of_budget: Decimal  # how far through the daily budget, for the alert body
 
 
 def evaluate(spent_micros: int, budget) -> Decision:
@@ -42,11 +42,11 @@ def evaluate(spent_micros: int, budget) -> Decision:
         )
     # Every threshold, not just the highest: one large call can jump 70% -> 120%.
     # The caller claims each separately, so only unseen ones send.
-    pct = Decimal(spent_micros) * 100 / Decimal(budget.daily_micros)
+    pct_of_budget = Decimal(spent_micros) * 100 / Decimal(budget.daily_micros)
     return Decision(
-        crossed=tuple(p for p in budget.alert_pcts if pct >= p),
-        runaway=spent_micros >= budget.runaway_micros,
-        pct=pct,
+        crossed_pcts=tuple(pct for pct in budget.alert_pcts if pct_of_budget >= pct),
+        is_runaway=spent_micros >= budget.runaway_micros,
+        pct_of_budget=pct_of_budget,
     )
 
 
@@ -58,14 +58,14 @@ def notify(sns, topic_arn: str | None, subject: str, body: dict) -> str:
             f"Set notify_topic_arn on the budget row or NOTIFY_TOPIC_ARN on the function."
         )
     try:
-        resp = sns.publish(
+        response = sns.publish(
             TopicArn=topic_arn,
             Subject=subject[:_SNS_SUBJECT_LIMIT],  # SNS hard limit
             Message=json.dumps(body, indent=2, default=str),
         )
     except Exception as exc:
         raise AlertDeliveryFailed(f"SNS publish failed for {subject!r}: {exc!r}") from exc
-    return str(resp.get("MessageId", ""))
+    return str(response.get("MessageId", ""))
 
 
 def access_keys_for(iam, principal) -> set[str]:
@@ -75,16 +75,16 @@ def access_keys_for(iam, principal) -> set[str]:
         # A property of the credential type, not a failure.
         return set()
     try:
-        resp = iam.list_access_keys(UserName=principal.name)
+        response = iam.list_access_keys(UserName=principal.name)
     except Exception as exc:
         raise KeyLookupFailed(
             f"could not list access keys for {principal.name!r}, so there is no "
             f"way to know what to deactivate: {exc!r}"
         ) from exc
     return {
-        k["AccessKeyId"]
-        for k in resp.get("AccessKeyMetadata", [])
-        if k.get("Status") == "Active"
+        key["AccessKeyId"]
+        for key in response.get("AccessKeyMetadata", [])
+        if key.get("Status") == "Active"
     }
 
 
@@ -97,19 +97,19 @@ def deactivate_keys(iam, user_name: str, access_key_ids: set[str]) -> set[str]:
     #
     # Every key is attempted before anything raises, so one throttled call
     # cannot leave the rest live. A partial result still raises.
-    done, failed = set(), {}
+    deactivated, failures = set(), {}
     for key_id in sorted(access_key_ids):
         try:
             iam.update_access_key(UserName=user_name, AccessKeyId=key_id, Status="Inactive")
-            done.add(key_id)
+            deactivated.add(key_id)
         except Exception as exc:
-            log.error("could not deactivate %s for %s", key_id, user_name, exc_info=True)
-            failed[key_id] = repr(exc)
-    if failed:
+            logger.error("could not deactivate %s for %s", key_id, user_name, exc_info=True)
+            failures[key_id] = repr(exc)
+    if failures:
         raise DeactivationFailed(
-            f"{len(failed)} of {len(access_key_ids)} access keys for {user_name!r} are "
-            f"still active: {failed}",
-            deactivated=sorted(done),
-            still_active=sorted(failed),
+            f"{len(failures)} of {len(access_key_ids)} access keys for {user_name!r} are "
+            f"still active: {failures}",
+            deactivated=sorted(deactivated),
+            still_active=sorted(failures),
         )
-    return done
+    return deactivated

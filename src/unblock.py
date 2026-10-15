@@ -100,7 +100,7 @@ def handler(event, context):
             )
             reactivated.append(key_id)
         except Exception as exc:  # noqa: BLE001 - every key is attempted, then reported
-            logger.error("reactivate failures %s/%s", user_name, key_id, exc_info=True)
+            logger.error("reactivate failed %s/%s", user_name, key_id, exc_info=True)
             failures[key_id] = repr(exc)
 
     if failures:
@@ -114,7 +114,7 @@ def handler(event, context):
             still_inactive=sorted(failures),
         )
 
-    # Not wrapped: a failures delete must not be reported as a release, or the
+    # Not wrapped: a failed delete must not be reported as a release, or the
     # track sits listed as disabled with live keys and the next runaway no-ops.
     ledger.clear_disabled(aws_clients["usage"], track)
 

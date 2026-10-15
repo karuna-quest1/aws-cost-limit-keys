@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "utc_day",
     "claim_count",
+    "release_count",
     "accumulate",
     "current_total",
     "claim_threshold",
@@ -79,6 +80,13 @@ def claim_count(table, request_id: str, now: float | None = None) -> bool:
         if is_conditional_check_failure(exc):
             return False
         raise LedgerWriteFailed(f"dedup write failed for request {request_id}: {exc!r}") from exc
+
+
+def release_count(table, request_id: str) -> None:
+    """Undo a dedup claim whose accumulate did not happen."""
+    # Keeping it drops this call's cost from the ledger permanently: the claim is
+    # one-shot, so the retry would take the duplicate path and add nothing.
+    table.delete_item(Key={"pk": f"REQ#{request_id}", "sk": "SEEN"})
 
 
 # ---------------------------------------------------------------------------
@@ -174,7 +182,9 @@ def accumulate(
         # UPDATED_NEW always returns an ADDed attribute. Guessing instead would
         # hand enforcement a number that is too small.
         raise LedgerWriteFailed(
-            f"accumulate for {key} returned no spent_micros; cannot evaluate the budget"
+            f"accumulate for {key} returned no spent_micros; cannot evaluate the budget",
+            # The ADD itself may have applied, so the caller must keep its claim.
+            may_have_written=True,
         )
     return int(attributes["spent_micros"])
 

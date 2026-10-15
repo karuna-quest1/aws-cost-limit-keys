@@ -246,6 +246,31 @@ class TestLedgerAgainstRealDynamoSemantics(unittest.TestCase):
         self.assertNotIn("ttl", record)
         self.assertEqual(record["keys"], {f"{USER_NAME}/AKIA1"})
 
+    def test_an_update_returning_no_total_is_flagged_as_maybe_written(self):
+        """The one failure where the ADD may have applied anyway.
+
+        UPDATED_NEW always returns an ADDed attribute, so this is a cannot-happen
+        guard -- but if it ever did happen, the caller must keep its dedup claim
+        rather than release it, or the retry would count the call twice.
+        """
+
+        class SilentUpdate(FakeTable):
+            def update_item(self, **kwargs):
+                super().update_item(**kwargs)
+                return {"Attributes": {}}
+
+        with self.assertRaises(errors.LedgerWriteFailed) as caught:
+            ledger.accumulate(
+                SilentUpdate(),
+                track=TRACK,
+                day="2026-10-06",
+                model_id=SONNET,
+                principal_name=USER_NAME,
+                usage=self.usage,
+                micros=61_950,
+            )
+        self.assertTrue(caught.exception.may_have_written)
+
     def test_utc_day_honours_epoch_zero(self):
         self.assertEqual(ledger.utc_day(0), "1970-01-01")
 
@@ -492,6 +517,40 @@ class TestFailuresRaise(WiredTestCase):
     def test_no_topic_configured_is_an_error_not_a_log_line(self):
         with self.assertRaises(errors.AlertDeliveryFailed):
             enforce.notify(FakeSNS(), None, "subject", {})
+
+    def test_a_failed_accumulate_releases_the_dedup_claim_for_the_retry(self):
+        """Otherwise the claim is one-shot and that call's cost is lost forever."""
+        aws_clients = self._aws_clients = wiring()
+        aws_clients["usage"].fail_on.add("update_item")
+
+        with self.assertRaises(errors.BatchIncomplete):
+            handler.handler(cloudwatch_event([log_entry()]), None)
+        self.assertNotIn(("REQ#abcd1234-5678-efgh-ijkl", "SEEN"), aws_clients["usage"].items)
+
+        # so the redelivery counts the line instead of calling it a duplicate
+        aws_clients["usage"].fail_on.clear()
+        stats = handler.handler(cloudwatch_event([log_entry()]), None)
+        self.assertEqual(stats["counted"], 1)
+        self.assertEqual(int(day_row(aws_clients)["spent_micros"]), 61_950)
+
+    def test_a_write_that_may_have_landed_keeps_the_claim(self):
+        """Releasing an ambiguous failure would count the same call twice."""
+        self.assertFalse(errors.LedgerWriteFailed("x").may_have_written)
+        aws_clients = self._aws_clients = wiring()
+
+        real_accumulate = ledger.accumulate
+
+        def ambiguous(*args, **kwargs):
+            raise errors.LedgerWriteFailed("returned no spent_micros", may_have_written=True)
+
+        ledger.accumulate = ambiguous
+        try:
+            with self.assertRaises(errors.BatchIncomplete):
+                handler.handler(cloudwatch_event([log_entry()]), None)
+        finally:
+            ledger.accumulate = real_accumulate
+
+        self.assertIn(("REQ#abcd1234-5678-efgh-ijkl", "SEEN"), aws_clients["usage"].items)
 
     def test_failed_dedup_write_raises_rather_than_counting_anyway(self):
         table = FakeTable(fail_on=["put_item"])

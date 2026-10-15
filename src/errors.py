@@ -57,6 +57,12 @@ class InvalidBudget(CostLimitError):
 class LedgerWriteFailed(CostLimitError):
     """A DynamoDB write the meter depends on did not happen."""
 
+    def __init__(self, message: str, *, may_have_written: bool = False):
+        super().__init__(message)
+        # True when the write may have landed despite the failure. A dedup claim
+        # must then be kept: releasing it would count the same call twice.
+        self.may_have_written = may_have_written
+
 
 class AlertDeliveryFailed(CostLimitError):
     """The alert did not reach SNS. Fatal: the threshold claim is already spent."""

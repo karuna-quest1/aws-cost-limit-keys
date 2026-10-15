@@ -126,15 +126,24 @@ def process_log_entry(message: str, aws_clients: dict) -> str:
     day = ledger.utc_day()
 
     if ledger.claim_count(aws_clients["usage"], request_id):
-        total = ledger.accumulate(
-            aws_clients["usage"],
-            track=attribution.track,
-            day=day,
-            model_id=model_id,
-            principal_name=attribution.principal.name,
-            usage=usage,
-            micros=priced_usage.micros,
-        )
+        try:
+            total = ledger.accumulate(
+                aws_clients["usage"],
+                track=attribution.track,
+                day=day,
+                model_id=model_id,
+                principal_name=attribution.principal.name,
+                usage=usage,
+                micros=priced_usage.micros,
+            )
+        except Exception as exc:  # noqa: BLE001 - re-raised below, after the release
+            # The claim is a lie if the spend was not recorded, and it is
+            # one-shot, so the retry would treat this line as a duplicate and
+            # add nothing. Release it unless the write may actually have landed,
+            # where releasing would count the same call twice instead.
+            if not getattr(exc, "may_have_written", False):
+                ledger.release_count(aws_clients["usage"], request_id)
+            raise
         outcome = "counted"
     else:
         # Already counted, by an earlier delivery or a concurrent invocation.

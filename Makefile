@@ -1,4 +1,4 @@
-.PHONY: test deploy seed seed-track enforce watch status unblock
+.PHONY: test deploy seed seed-track enforce watch status unblock rates refresh-rates
 
 BUDGET_TABLE     ?= bedrock_budgets
 USAGE_TABLE      ?= bedrock_usage
@@ -62,6 +62,21 @@ status:
 	  --expression-attribute-names '{"#day":"day"}' \
 	  --expression-attribute-values '{":day":{"S":"$(DAY)"}}' \
 	  --query 'Items[].{track:pk.S,spent_micros:spent_micros.N,calls:calls.N}' --output table
+
+# The live rate card, as the meter reads it. `models` is model id -> the four
+# USD-per-million rates. An EMPTY RESULT MEANS THERE ARE NO PRICES AT ALL and
+# every model is being charged at the fallback rate; run refresh-rates.
+rates:
+	aws dynamodb get-item --table-name $(BUDGET_TABLE) \
+	  --key '{"scope":{"S":"RATECARD#CURRENT"}}' \
+	  --query 'Item.{fetched_at:fetched_at.S,region:region.S,previous:previous_scope.S,models:models.M}' \
+	  --output json
+
+# Fetch prices now rather than waiting for the weekly schedule. Run this once
+# after deploying, or the first refresh is seven days away.
+refresh-rates:
+	aws lambda invoke --function-name bedrock-cost-limits-refresh-rates \
+	  --cli-binary-format raw-in-base64-out /dev/stdout
 
 unblock:
 	@test -n "$(TRACK)" || (echo "TRACK is required: make unblock TRACK=<name> REASON='...'"; exit 1)

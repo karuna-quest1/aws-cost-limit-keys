@@ -18,6 +18,7 @@ what happens when an AWS call fails.
 from __future__ import annotations
 
 import copy
+import json
 
 
 class _AwsError(Exception):
@@ -249,3 +250,29 @@ class FakeSNS:
             raise _AwsError("InternalError", "SNS is unavailable")
         self.published.append({"TopicArn": TopicArn, "Subject": Subject, "Message": Message})
         return {"MessageId": f"fake-{len(self.published)}"}
+
+
+class FakePricing:
+    """Enough of the Price List API to exercise pricelist.fetch.
+
+    `pages` is a list of lists of product dicts. The real API returns each
+    product as a JSON *string*, and encoding them here is the point: a fake that
+    handed back dicts would hide a missing json.loads.
+    """
+
+    def __init__(self, pages=(), fail=False):
+        self.pages = [list(page) for page in pages]
+        self.fail = fail
+        self.paginate_calls: list[dict] = []
+
+    def get_paginator(self, operation_name):
+        assert operation_name == "get_products", operation_name
+        return self
+
+    def paginate(self, **kwargs):
+        self.paginate_calls.append(kwargs)
+        if self.fail:
+            raise ThrottlingException()
+        return [
+            {"PriceList": [json.dumps(product) for product in page]} for page in self.pages
+        ]

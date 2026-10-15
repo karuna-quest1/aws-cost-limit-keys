@@ -21,6 +21,9 @@ __all__ = [
     "NotDisabled",
     "ReactivationFailed",
     "BatchIncomplete",
+    "RateCardUnavailable",
+    "RateCardRejected",
+    "PriceListUnavailable",
     "aws_error_code",
     "is_conditional_check_failure",
     "is_validation_error",
@@ -95,6 +98,22 @@ class BatchIncomplete(CostLimitError):
         super().__init__(
             f"{len(self.failures)} of {stats.get('seen', 0)} log lines failed -- {detail}"
         )
+
+
+class RateCardUnavailable(CostLimitError):
+    """The refreshed rate card could not be read. The baseline is used instead."""
+
+
+class RateCardRejected(CostLimitError):
+    """A fetched rate card failed validation and was not promoted."""
+
+    def __init__(self, message: str, *, reasons=()):
+        super().__init__(message)
+        self.reasons = tuple(reasons)
+
+
+class PriceListUnavailable(CostLimitError):
+    """The AWS Price List API could not be read or could not be understood."""
 
 
 # botocore raises one class, ClientError, for everything; the discriminator is a

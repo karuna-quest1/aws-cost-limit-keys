@@ -63,3 +63,59 @@ def cloudwatch_event(entries):
     }
     blob = gzip.compress(json.dumps(payload).encode())
     return {"awslogs": {"data": base64.b64encode(blob).decode()}}
+
+
+# --------------------------------------------------------------------------
+# AWS Price List products, in the shape `pricing:GetProducts` returns them.
+# --------------------------------------------------------------------------
+def price_list_product(
+    model_name="Claude Sonnet 4.5",
+    usage_type="USE1-InputTokenCount",
+    usd_per_unit="0.003",
+    unit="1K tokens",
+    sku="SKU0001",
+    inference_type="On-demand",
+    begin_range="0",
+):
+    return {
+        "product": {
+            "sku": sku,
+            "productFamily": "Bedrock Token Usage",
+            "attributes": {
+                "servicecode": "AmazonBedrock",
+                "regionCode": "us-east-1",
+                "model": model_name,
+                "usagetype": usage_type,
+                "inferenceType": inference_type,
+                "operation": "",
+            },
+        },
+        "terms": {
+            "OnDemand": {
+                f"{sku}.JRTCKXETXF": {
+                    "priceDimensions": {
+                        f"{sku}.JRTCKXETXF.6YS6EN2CT7": {
+                            "beginRange": begin_range,
+                            "unit": unit,
+                            "pricePerUnit": {"USD": usd_per_unit},
+                        }
+                    }
+                }
+            }
+        },
+    }
+
+
+def sonnet_price_list(input_usd="0.003", output_usd="0.015", cache_read_usd="0.0003",
+                      cache_write_usd="0.00375", model_name="Claude Sonnet 4.5"):
+    """The four SKUs that make one complete model entry, priced per 1K tokens."""
+    return [
+        price_list_product(model_name, "USE1-InputTokenCount", input_usd, sku="SKU-IN"),
+        price_list_product(model_name, "USE1-OutputTokenCount", output_usd, sku="SKU-OUT"),
+        price_list_product(
+            model_name, "USE1-CacheReadInputTokenCount", cache_read_usd, sku="SKU-CR"
+        ),
+        price_list_product(
+            model_name, "USE1-CacheWriteInputTokenCount", cache_write_usd, sku="SKU-CW"
+        ),
+    ]

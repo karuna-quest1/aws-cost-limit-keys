@@ -1,6 +1,7 @@
 """identity.arn -> track, from IAM tags on the calling principal.
 
-`Track` is the whole attribution key, so this assumes one key per track.
+`Track` is the only tag read, and the whole attribution key, so this assumes
+one key per track.
 Three caches: in-process 15 min, DynamoDB 24 h, negative 60 s.
 """
 
@@ -44,8 +45,6 @@ class Principal(NamedTuple):
 
 class Attribution(NamedTuple):
     track: str
-    owner: str | None
-    env: str | None
     principal: Principal
 
 
@@ -83,12 +82,7 @@ def _from_tags(tags: dict[str, str], principal: Principal) -> Attribution:
             f"Its Bedrock spend cannot be attributed or limited until it is "
             f"tagged. Tags present: {sorted(tags)}"
         )
-    return Attribution(
-        track=track,
-        owner=tags.get("Owner"),
-        env=tags.get("Env"),
-        principal=principal,
-    )
+    return Attribution(track=track, principal=principal)
 
 
 def _read_item_cache(table, arn: str) -> Attribution | None:
@@ -106,12 +100,7 @@ def _read_item_cache(table, arn: str) -> Attribution | None:
         # a cache entry. This is also what ages out pre-`track` rows.
         logger.warning("discarding unusable tag cache row for %s", arn)
         return None
-    return Attribution(
-        track=track,
-        owner=item.get("owner"),
-        env=item.get("env"),
-        principal=principal,
-    )
+    return Attribution(track=track, principal=principal)
 
 
 def _write_item_cache(table, arn: str, attribution: Attribution, now: float) -> None:
@@ -121,9 +110,6 @@ def _write_item_cache(table, arn: str, attribution: Attribution, now: float) -> 
         "track": attribution.track,
         "ttl": int(now) + _ITEM_TTL_SECONDS,
     }
-    for key, value in (("owner", attribution.owner), ("env", attribution.env)):
-        if value:
-            item[key] = value
     try:
         table.put_item(Item=item)
     except Exception as exc:

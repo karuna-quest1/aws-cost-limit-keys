@@ -25,7 +25,10 @@ import errors  # noqa: E402
 import handler  # noqa: E402
 import identity  # noqa: E402
 import ledger  # noqa: E402
+import pricelist  # noqa: E402
 import pricing  # noqa: E402
+import ratecard  # noqa: E402
+import refresh_rates  # noqa: E402
 import unblock  # noqa: E402
 from events import (  # noqa: E402
     ARN_ASSUMED,
@@ -35,30 +38,62 @@ from events import (  # noqa: E402
     USER_NAME,
     cloudwatch_event,
     log_entry,
+    price_list_product,
+    sonnet_price_list,
 )
-from fakes import FakeIAM, FakeSNS, FakeTable  # noqa: E402
+from fakes import FakeIAM, FakePricing, FakeSNS, FakeTable  # noqa: E402
 
 TOPIC = "arn:aws:sns:us-east-1:123456789012:bedrock-alerts"
 
+SONNET_ID = "anthropic.claude-sonnet-4-5-20250929-v1:0"
+FRESH = "2026-10-14T03:00:00+00:00"
 
-def budget_table(daily_usd="50", enforce_flag=False, multiple="1.5", scope=f"TRACK#{TRACK}"):
-    return FakeTable(
-        items={
-            (scope,): {
-                "scope": scope,
-                "daily_usd": Decimal(daily_usd),
-                "runaway_multiple": Decimal(multiple),
-                "alert_pcts": {80, 100},
-                "notify_topic_arn": TOPIC,
-                "enforce": enforce_flag,
-            }
-        },
-        key_names=("scope",),
+
+def rates(input_="3", output="15", cache_read="0.3", cache_write="3.75"):
+    return pricing.Rates(
+        input=Decimal(input_),
+        output=Decimal(output),
+        cache_read=Decimal(cache_read),
+        cache_write=Decimal(cache_write),
     )
+
+
+def rate_card_item(models=None, fetched_at=FRESH, **extra):
+    """The RATECARD#CURRENT row. Sonnet at the published prices unless told otherwise."""
+    return {
+        "scope": ratecard.CURRENT_SCOPE,
+        **ratecard.item_from_rates(
+            {SONNET_ID: rates()} if models is None else models,
+            fetched_at=fetched_at,
+            source="AmazonBedrock:us-east-1",
+            region="us-east-1",
+        ),
+        **extra,
+    }
+
+
+def budget_table(daily_usd="50", enforce_flag=False, multiple="1.5", scope=f"TRACK#{TRACK}",
+                 card=True):
+    items = {
+        (scope,): {
+            "scope": scope,
+            "daily_usd": Decimal(daily_usd),
+            "runaway_multiple": Decimal(multiple),
+            "alert_pcts": {80, 100},
+            "notify_topic_arn": TOPIC,
+            "enforce": enforce_flag,
+        }
+    }
+    # There is no committed card any more, so the meter has to read one from the
+    # table or everything prices at FALLBACK.
+    if card:
+        items[(ratecard.CURRENT_SCOPE,)] = rate_card_item()
+    return FakeTable(items=items, key_names=("scope",))
 
 
 def wiring(daily_usd="50", enforce_flag=False, tags=None, **iam_kwargs):
     identity.reset_cache()
+    ratecard.reset_cache()
     return {
         "usage": FakeTable(),
         "budgets": budget_table(daily_usd, enforce_flag),
@@ -90,11 +125,13 @@ class WiredTestCase(unittest.TestCase):
         self._real_topic = handler.NOTIFY_TOPIC_ARN
         handler.NOTIFY_TOPIC_ARN = TOPIC
         identity.reset_cache()
+        ratecard.reset_cache()
 
     def tearDown(self):
         handler.clients = self._real_clients
         handler.NOTIFY_TOPIC_ARN = self._real_topic
         handler._clients.clear()
+        ratecard.reset_cache()
 
 
 # --------------------------------------------------------------------------
@@ -105,25 +142,23 @@ class TestPricing(unittest.TestCase):
         usage = pricing.usage_from_log(log_entry())
         self.assertEqual(usage, pricing.Usage(12_400, 850, 40_000, 0))
         # 12400*3 + 850*15 + 40000*0.30 = 37200 + 12750 + 12000 micro-USD
-        self.assertEqual(pricing.price(usage, SONNET).micros, 61_950)
+        self.assertEqual(pricing.price(usage, SONNET, rates()).micros, 61_950)
 
     def test_cache_reads_are_not_billed_as_input(self):
         """The whole reason the card carries four rates and not two."""
-        as_input = pricing.price(pricing.Usage(40_000, 0, 0, 0), SONNET).micros
-        as_cache = pricing.price(pricing.Usage(0, 0, 40_000, 0), SONNET).micros
+        as_input = pricing.price(pricing.Usage(40_000, 0, 0, 0), SONNET, rates()).micros
+        as_cache = pricing.price(pricing.Usage(0, 0, 40_000, 0), SONNET, rates()).micros
         self.assertEqual(as_input, 120_000)
         self.assertEqual(as_cache, 12_000)  # 10x cheaper; collapsing them overstates badly
 
-    def test_geography_prefix_resolves_to_the_same_card(self):
-        bare = pricing.price(
-            pricing.Usage(1000, 0, 0, 0), "anthropic.claude-sonnet-4-5-20250929-v1:0"
-        )
-        prefixed = pricing.price(pricing.Usage(1000, 0, 0, 0), SONNET)
-        self.assertEqual(bare.micros, prefixed.micros)
-        self.assertFalse(prefixed.is_fallback)
+    def test_geography_prefix_resolves_to_the_same_card_entry(self):
+        """`us.` and the bare id must find the same row, or one of them is FALLBACK."""
+        card = ratecard.RateCard({SONNET_ID: rates()}, FRESH, False)
+        self.assertEqual(card.rate_for(SONNET), card.rate_for(SONNET_ID))
+        self.assertIsNotNone(card.rate_for(SONNET))
 
-    def test_unknown_model_is_expensive_and_flagged_never_free(self):
-        priced_usage = pricing.price(pricing.Usage(1000, 0, 0, 0), "meta.llama-not-in-card")
+    def test_a_model_with_no_card_entry_is_expensive_and_flagged_never_free(self):
+        priced_usage = pricing.price(pricing.Usage(1000, 0, 0, 0), "meta.llama-not-on-card")
         self.assertTrue(priced_usage.is_fallback)
         self.assertGreater(priced_usage.micros, 0)  # free would mean an unlimited budget
 
@@ -541,11 +576,14 @@ class TestIdentity(unittest.TestCase):
         self.assertIsNone(identity.parse_arn("not-an-arn"))
 
     def test_the_track_tag_is_the_whole_attribution(self):
+        """Other tags are read from IAM and deliberately not carried or cached."""
         iam = FakeIAM(tags={USER_NAME: {"Track": TRACK, "Owner": "platform-team"}})
-        attribution = identity.resolve(ARN_USER, iam, FakeTable())
-        self.assertEqual(attribution.track, TRACK)
-        self.assertEqual(attribution.owner, "platform-team")
+        table = FakeTable()
+        attribution = identity.resolve(ARN_USER, iam, table)
+        self.assertEqual(attribution, identity.Attribution(TRACK, attribution.principal))
         self.assertEqual(attribution.principal.name, USER_NAME)
+        cached = table.items[(f"ARN#{ARN_USER}", "TAGS")]
+        self.assertEqual(sorted(cached), ["pk", "sk", "track", "ttl"])
 
     def test_an_unparseable_arn_raises(self):
         with self.assertRaises(errors.AttributionUnavailable):
@@ -686,6 +724,408 @@ class TestUnblock(WiredTestCase):
         self._aws_clients = self._disable_track()
         with self.assertRaises(errors.MalformedLogEntry):
             unblock.handler({"track": TRACK, "reason": "oops"}, None)
+
+
+
+# --------------------------------------------------------------------------
+# 10. The weekly rate card: reading it, and refusing a bad one.
+# --------------------------------------------------------------------------
+class TestRateCardLoad(unittest.TestCase):
+    def setUp(self):
+        ratecard.reset_cache()
+
+    def tearDown(self):
+        ratecard.reset_cache()
+
+    def test_no_card_at_all_means_every_model_is_the_fallback(self):
+        """There is no committed card any more, so this is the only safe answer."""
+        self.assertIsNone(ratecard.load(FakeTable(key_names=("scope",))))
+        priced = pricing.price(pricing.Usage(1000, 0, 0, 0), SONNET, None)
+        self.assertTrue(priced.is_fallback)
+        self.assertEqual(priced.micros, 20_000)  # FALLBACK input, not Sonnet's 3_000
+
+    def test_a_stored_card_prices_the_models_on_it(self):
+        table = FakeTable(items={(ratecard.CURRENT_SCOPE,): rate_card_item()},
+                          key_names=("scope",))
+        card = ratecard.load(table, now=_epoch("2026-10-15T00:00:00+00:00"))
+        self.assertFalse(card.is_stale)
+        priced = pricing.price(pricing.Usage(1000, 0, 0, 0), SONNET, card.rate_for(SONNET))
+        self.assertEqual(priced.micros, 3_000)
+        self.assertFalse(priced.is_fallback)
+
+    def test_a_model_missing_from_the_card_is_the_fallback(self):
+        table = FakeTable(items={(ratecard.CURRENT_SCOPE,): rate_card_item()},
+                          key_names=("scope",))
+        card = ratecard.load(table)
+        self.assertIsNone(card.rate_for("meta.llama-not-on-card"))
+
+    def test_a_failed_read_raises_rather_than_charging_the_fallback(self):
+        """A blip must not bake a 6x price into the ledger; the retry is cheap."""
+        table = FakeTable(items={(ratecard.CURRENT_SCOPE,): rate_card_item()},
+                          key_names=("scope",))
+        table.fail_on.add("get_item")
+        with self.assertRaises(errors.RateCardUnavailable):
+            ratecard.load(table)
+
+    def test_a_half_written_card_is_discarded_not_half_used(self):
+        """A missing token class would price those tokens at zero -- no limit at all."""
+        broken = rate_card_item()
+        del broken["models"][SONNET_ID]["cache_read"]
+        table = FakeTable(items={(ratecard.CURRENT_SCOPE,): broken}, key_names=("scope",))
+        self.assertIsNone(ratecard.load(table))
+
+    def test_a_card_nobody_has_refreshed_in_a_month_is_stale(self):
+        table = FakeTable(items={(ratecard.CURRENT_SCOPE,): rate_card_item()},
+                          key_names=("scope",))
+        self.assertFalse(ratecard.load(table, now=_epoch("2026-10-15T00:00:00+00:00")).is_stale)
+        ratecard.reset_cache()
+        self.assertTrue(ratecard.load(table, now=_epoch("2026-12-01T00:00:00+00:00")).is_stale)
+
+    def test_the_card_is_read_once_per_container_not_once_per_line(self):
+        table = FakeTable(items={(ratecard.CURRENT_SCOPE,): rate_card_item()},
+                          key_names=("scope",))
+        for _ in range(5):
+            ratecard.load(table)
+        reads = [call for call in table.calls if call[0] == "get_item"]
+        self.assertEqual(len(reads), 1)
+
+
+class TestRateCardValidation(unittest.TestCase):
+    """Every rejection here is a card that would have mis-metered every track."""
+
+    def test_a_clean_card_passes(self):
+        ratecard.validate({SONNET_ID: rates()}, {SONNET_ID: rates()})
+
+    def test_an_empty_card_is_rejected(self):
+        with self.assertRaises(errors.RateCardRejected):
+            ratecard.validate({}, {SONNET_ID: rates()})
+
+    def test_a_zero_rate_is_rejected_because_it_means_no_limit(self):
+        with self.assertRaises(errors.RateCardRejected):
+            ratecard.validate({SONNET_ID: rates(output="0")}, {})
+
+    def test_cache_reads_costing_more_than_input_is_rejected(self):
+        """The token-class mix-up. Cache reads bill at about a tenth of input."""
+        with self.assertRaises(errors.RateCardRejected) as caught:
+            ratecard.validate({SONNET_ID: rates(cache_read="9")}, {})
+        self.assertTrue(any("cache_read" in reason for reason in caught.exception.reasons))
+
+    def test_a_thousand_fold_move_is_rejected(self):
+        """What a per-1K price parsed as per-million looks like."""
+        with self.assertRaises(errors.RateCardRejected) as caught:
+            ratecard.validate({SONNET_ID: rates(input_="3000")}, {SONNET_ID: rates()})
+        self.assertTrue(any("moved" in reason for reason in caught.exception.reasons))
+
+    def test_a_small_real_price_change_is_accepted(self):
+        ratecard.validate({SONNET_ID: rates(input_="3.30")}, {SONNET_ID: rates()})
+
+    def test_a_brand_new_model_has_nothing_to_drift_from(self):
+        ratecard.validate({"new.model-v1:0": rates(input_="99")}, {SONNET_ID: rates()})
+
+    def test_a_dropped_model_keeps_its_last_known_rate(self):
+        """Otherwise it has no row and prices at FALLBACK for no reason of its own."""
+        merged = ratecard.merge_over_current({"new.model-v1:0": rates()}, {SONNET_ID: rates()})
+        self.assertEqual(sorted(merged), sorted([SONNET_ID, "new.model-v1:0"]))
+
+    def test_a_round_trip_through_dynamodb_keeps_the_cents(self):
+        item = ratecard.item_from_rates(
+            {SONNET_ID: rates()}, fetched_at=FRESH, source="test", region="us-east-1",
+        )
+        self.assertEqual(ratecard.rates_from_item(item)[SONNET_ID], rates())
+
+
+class TestPriceListParsing(unittest.TestCase):
+    def test_four_skus_become_one_model_entry_in_usd_per_million(self):
+        result = pricelist.fetch(FakePricing([sonnet_price_list()]), "us-east-1")
+        self.assertEqual(
+            result.rates[SONNET_ID],
+            pricing.Rates(
+                input=Decimal("3.000"),
+                output=Decimal("15.000"),
+                cache_read=Decimal("0.300"),
+                cache_write=Decimal("3.750"),
+            ),
+        )
+        self.assertEqual(result.skus_read, 4)
+        self.assertEqual(result.unmapped_names, ())
+
+    def test_the_price_list_is_filtered_by_region(self):
+        fake = FakePricing([sonnet_price_list()])
+        pricelist.fetch(fake, "eu-west-1")
+        self.assertIn(
+            {"Type": "TERM_MATCH", "Field": "regionCode", "Value": "eu-west-1"},
+            fake.paginate_calls[0]["Filters"],
+        )
+
+    def test_a_cache_sku_is_not_mistaken_for_input(self):
+        """`CacheReadInputTokenCount` contains `InputToken`; order decides this."""
+        self.assertEqual(pricelist._token_class("USE1-CacheReadInputTokenCount"), "cache_read")
+        self.assertEqual(pricelist._token_class("USE1-CacheWriteInputTokenCount"), "cache_write")
+        self.assertEqual(pricelist._token_class("USE1-InputTokenCount"), "input")
+
+    def test_a_price_quoted_per_million_is_not_scaled_again(self):
+        skus = sonnet_price_list()
+        for sku in skus:
+            sku["terms"]["OnDemand"][f"{sku['product']['sku']}.JRTCKXETXF"]["priceDimensions"][
+                f"{sku['product']['sku']}.JRTCKXETXF.6YS6EN2CT7"
+            ].update({"unit": "1M tokens", "pricePerUnit": {"USD": "3.00"}})
+        result = pricelist.fetch(FakePricing([skus]), "us-east-1")
+        self.assertEqual(result.rates[SONNET_ID].input, Decimal("3.00"))
+
+    def test_an_unknown_unit_raises_rather_than_guessing(self):
+        """Guessing between per-1K and per-million is a 1000x error in every budget."""
+        skus = sonnet_price_list()
+        sku = skus[0]
+        sku["terms"]["OnDemand"]["SKU-IN.JRTCKXETXF"]["priceDimensions"][
+            "SKU-IN.JRTCKXETXF.6YS6EN2CT7"
+        ]["unit"] = "Furlongs"
+        with self.assertRaises(errors.PriceListUnavailable):
+            pricelist.fetch(FakePricing([skus]), "us-east-1")
+
+    def test_a_model_name_nobody_mapped_is_reported_not_guessed(self):
+        skus = sonnet_price_list(model_name="Claude Nebula 9")
+        with self.assertRaises(errors.PriceListUnavailable):
+            # nothing else was recognisable, so there is no card to promote
+            pricelist.fetch(FakePricing([skus]), "us-east-1")
+
+    def test_an_unmapped_model_alongside_a_mapped_one_is_listed(self):
+        pages = [sonnet_price_list() + sonnet_price_list(model_name="Claude Nebula 9")]
+        result = pricelist.fetch(FakePricing(pages), "us-east-1")
+        self.assertIn(SONNET_ID, result.rates)
+        self.assertEqual(result.unmapped_names, ("Claude Nebula 9",))
+
+    def test_provisioned_and_batch_skus_are_ignored(self):
+        pages = [
+            sonnet_price_list()
+            + [price_list_product(usage_type="USE1-InputTokenCount", inference_type="Provisioned",
+                                  usd_per_unit="99", sku="SKU-PT")]
+        ]
+        result = pricelist.fetch(FakePricing(pages), "us-east-1")
+        self.assertEqual(result.rates[SONNET_ID].input, Decimal("3.000"))
+
+    def test_a_model_without_caching_defaults_to_the_input_rate(self):
+        """Its cached token counts are zero, so this never multiplies anything."""
+        skus = sonnet_price_list()[:2]  # input and output only
+        result = pricelist.fetch(FakePricing([skus]), "us-east-1")
+        self.assertEqual(result.rates[SONNET_ID].cache_read, Decimal("3.000"))
+        self.assertEqual(
+            sorted(result.defaulted),
+            [f"{SONNET_ID}.cache_read", f"{SONNET_ID}.cache_write"],
+        )
+
+    def test_a_model_missing_its_output_rate_raises(self):
+        """Half a card is worse than none: it would under-count every reply."""
+        skus = [sonnet_price_list()[0]]  # input only
+        with self.assertRaises(errors.PriceListUnavailable):
+            pricelist.fetch(FakePricing([skus]), "us-east-1")
+
+    def test_a_failed_price_list_call_raises(self):
+        with self.assertRaises(errors.PriceListUnavailable):
+            pricelist.fetch(FakePricing([], fail=True), "us-east-1")
+
+    def test_recognising_nothing_raises_rather_than_promoting_an_empty_card(self):
+        with self.assertRaises(errors.PriceListUnavailable):
+            pricelist.fetch(FakePricing([[]]), "us-east-1")
+
+
+class TestRefreshRates(unittest.TestCase):
+    """The weekly job: validate everything, then rotate exactly two rows."""
+
+    def setUp(self):
+        ratecard.reset_cache()
+        self._real_clients = refresh_rates.clients
+        self._real_topic = refresh_rates.NOTIFY_TOPIC_ARN
+        refresh_rates._clients.clear()
+        refresh_rates.clients = lambda: self._aws_clients
+        refresh_rates.NOTIFY_TOPIC_ARN = TOPIC
+
+    def tearDown(self):
+        refresh_rates.clients = self._real_clients
+        refresh_rates.NOTIFY_TOPIC_ARN = self._real_topic
+        refresh_rates._clients.clear()
+        ratecard.reset_cache()
+
+    def _wire(self, pages, budgets_table=None):
+        self._aws_clients = {
+            "budgets": budgets_table
+            if budgets_table is not None
+            else FakeTable(key_names=("scope",)),
+            "usage": FakeTable(),
+            "pricing": FakePricing(pages),
+            "sns": FakeSNS(),
+        }
+        return self._aws_clients
+
+    @staticmethod
+    def _scopes(aws_clients):
+        return sorted(key[0] for key in aws_clients["budgets"].items)
+
+    def test_a_first_run_writes_only_the_current_row(self):
+        aws_clients = self._wire([sonnet_price_list()])
+        result = refresh_rates.handler({}, None)
+
+        self.assertTrue(result["promoted"])
+        self.assertEqual(self._scopes(aws_clients), [ratecard.CURRENT_SCOPE])
+        stored = aws_clients["budgets"].items[(ratecard.CURRENT_SCOPE,)]
+        self.assertEqual(stored["models"][SONNET_ID]["input"], Decimal("3.000"))
+        self.assertIsNone(stored[ratecard.PREVIOUS_SCOPE_ATTR])
+
+    def test_the_second_run_keeps_the_outgoing_card_under_its_own_date(self):
+        table = FakeTable(items={(ratecard.CURRENT_SCOPE,): rate_card_item()},
+                          key_names=("scope",))
+        aws_clients = self._wire([sonnet_price_list(input_usd="0.0033")], table)
+        refresh_rates.handler({}, None)
+
+        self.assertEqual(
+            self._scopes(aws_clients), ["RATECARD#2026-10-14", ratecard.CURRENT_SCOPE]
+        )
+        # the dated row is the card that was live, not the one just fetched
+        self.assertEqual(
+            aws_clients["budgets"].items[("RATECARD#2026-10-14",)]["models"][SONNET_ID]["input"],
+            Decimal("3"),
+        )
+        current = aws_clients["budgets"].items[(ratecard.CURRENT_SCOPE,)]
+        self.assertEqual(current["models"][SONNET_ID]["input"], Decimal("3.300"))
+        self.assertEqual(current[ratecard.PREVIOUS_SCOPE_ATTR], "RATECARD#2026-10-14")
+
+    def test_there_are_never_more_than_two_rows(self):
+        table = FakeTable(
+            items={
+                (ratecard.CURRENT_SCOPE,): rate_card_item(
+                    **{ratecard.PREVIOUS_SCOPE_ATTR: "RATECARD#2026-10-07"}
+                ),
+                ("RATECARD#2026-10-07",): rate_card_item(fetched_at="2026-10-07T03:00:00+00:00"),
+            },
+            key_names=("scope",),
+        )
+        aws_clients = self._wire([sonnet_price_list(input_usd="0.0033")], table)
+        refresh_rates.handler({}, None)
+
+        scopes = self._scopes(aws_clients)
+        self.assertEqual(scopes, ["RATECARD#2026-10-14", ratecard.CURRENT_SCOPE])
+        self.assertNotIn("RATECARD#2026-10-07", scopes)  # two cards old, deleted
+
+    def test_a_rejected_card_writes_absolutely_nothing(self):
+        """Validation runs before any write, so DynamoDB is left exactly as it was."""
+        table = FakeTable(items={(ratecard.CURRENT_SCOPE,): rate_card_item()},
+                          key_names=("scope",))
+        aws_clients = self._wire([sonnet_price_list(input_usd="3.00")], table)  # -> $3000/M
+        with self.assertRaises(errors.RateCardRejected):
+            refresh_rates.handler({}, None)
+
+        self.assertEqual(self._scopes(aws_clients), [ratecard.CURRENT_SCOPE])
+        self.assertEqual(
+            aws_clients["budgets"].items[(ratecard.CURRENT_SCOPE,)]["models"][SONNET_ID]["input"],
+            Decimal("3"),
+        )
+        self.assertEqual(
+            [
+                call
+                for call in aws_clients["budgets"].calls
+                if call[0] in ("put_item", "delete_item")
+            ],
+            [],
+        )
+
+    def test_a_rejection_emails_the_old_and_new_numbers(self):
+        table = FakeTable(items={(ratecard.CURRENT_SCOPE,): rate_card_item()},
+                          key_names=("scope",))
+        aws_clients = self._wire([sonnet_price_list(input_usd="3.00")], table)
+        with self.assertRaises(errors.RateCardRejected):
+            refresh_rates.handler({}, None)
+
+        alert = aws_clients["sns"].published[0]
+        self.assertIn("REJECTED", alert["Subject"])
+        self.assertIn('"stored"', alert["Message"])
+        self.assertIn('"fetched"', alert["Message"])
+
+    def test_the_meter_then_prices_with_the_refreshed_card(self):
+        aws_clients = self._wire([sonnet_price_list(input_usd="0.006")])
+        refresh_rates.handler({}, None)
+        ratecard.reset_cache()
+        card = ratecard.load(aws_clients["budgets"])
+        self.assertEqual(
+            pricing.price(
+                pricing.Usage(1_000_000, 0, 0, 0), SONNET, card.rate_for(SONNET)
+            ).micros,
+            6_000_000,
+        )
+
+    def test_a_failed_price_list_leaves_everything_alone_and_raises(self):
+        table = FakeTable(items={(ratecard.CURRENT_SCOPE,): rate_card_item()},
+                          key_names=("scope",))
+        self._aws_clients = {
+            "budgets": table, "usage": FakeTable(),
+            "pricing": FakePricing([], fail=True), "sns": FakeSNS(),
+        }
+        with self.assertRaises(errors.PriceListUnavailable):
+            refresh_rates.handler({}, None)
+        self.assertEqual(self._scopes(self._aws_clients), [ratecard.CURRENT_SCOPE])
+
+    def test_an_unmapped_model_is_announced_once_a_day(self):
+        pages = [sonnet_price_list() + sonnet_price_list(model_name="Claude Nebula 9")]
+        aws_clients = self._wire(pages)
+        refresh_rates.handler({}, None)
+        aws_clients["pricing"] = FakePricing(pages)
+        refresh_rates.handler({}, None)
+        subjects = [alert["Subject"] for alert in aws_clients["sns"].published]
+        self.assertEqual(sum("refreshed with gaps" in subject for subject in subjects), 1)
+
+    def test_a_clean_refresh_sends_no_email(self):
+        aws_clients = self._wire([sonnet_price_list()])
+        refresh_rates.handler({}, None)
+        self.assertEqual(aws_clients["sns"].published, [])
+
+
+class TestMeterUsesTheCard(WiredTestCase):
+    """End to end: the row in the table has to be what the ledger records."""
+
+    def test_the_ledger_records_the_price_on_the_card(self):
+        aws_clients = self._aws_clients = wiring()
+        handler.handler(cloudwatch_event([log_entry()]), None)
+        # 12400*3 + 850*15 + 40000*0.30, from the seeded RATECARD#CURRENT row
+        self.assertEqual(int(day_row(aws_clients)["spent_micros"]), 61_950)
+
+    def test_changing_the_card_changes_what_is_charged(self):
+        aws_clients = self._aws_clients = wiring()
+        aws_clients["budgets"].items[(ratecard.CURRENT_SCOPE,)] = rate_card_item(
+            models={SONNET_ID: rates(input_="6", output="30", cache_read="0.6", cache_write="7.5")}
+        )
+        ratecard.reset_cache()
+        handler.handler(cloudwatch_event([log_entry()]), None)
+        self.assertEqual(int(day_row(aws_clients)["spent_micros"]), 123_900)
+
+    def test_no_card_at_all_charges_the_fallback_and_says_so(self):
+        aws_clients = self._aws_clients = wiring()
+        del aws_clients["budgets"].items[(ratecard.CURRENT_SCOPE,)]
+        ratecard.reset_cache()
+
+        handler.handler(cloudwatch_event([log_entry()]), None)
+
+        subjects = [alert["Subject"] for alert in aws_clients["sns"].published]
+        self.assertTrue(any("unpriced model" in subject for subject in subjects))
+        self.assertGreater(int(day_row(aws_clients)["spent_micros"]), 61_950)
+
+
+class TestStaleRateCardAlerts(WiredTestCase):
+    def test_a_stale_card_pages_once_a_day_across_every_track(self):
+        aws_clients = self._aws_clients = wiring()
+        aws_clients["budgets"].items[(ratecard.CURRENT_SCOPE,)] = rate_card_item(
+            fetched_at="2020-01-01T00:00:00+00:00"
+        )
+        ratecard.reset_cache()
+        for call_number in range(3):
+            handler.handler(
+                cloudwatch_event([log_entry(request_id=f"r{call_number}")]), None
+            )
+        subjects = [alert["Subject"] for alert in aws_clients["sns"].published]
+        self.assertEqual(sum("has not refreshed" in subject for subject in subjects), 1)
+
+
+def _epoch(stamp: str) -> float:
+    from datetime import datetime
+
+    return datetime.fromisoformat(stamp).timestamp()
 
 
 if __name__ == "__main__":

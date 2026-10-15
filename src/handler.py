@@ -20,6 +20,7 @@ import errors
 import identity
 import ledger
 import pricing
+import ratecard
 
 logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
@@ -118,7 +119,10 @@ def process_log_entry(message: str, aws_clients: dict) -> str:
     arn = (entry.get("identity") or {}).get("arn", "")
     attribution = identity.resolve(arn, aws_clients["iam"], aws_clients["usage"])
     usage = pricing.usage_from_log(entry)
-    priced_usage = pricing.price(usage, model_id, entry.get("region"))
+    # Memoised for 15 minutes, so this is one extra read per container, not per
+    # line. No card, or no entry on it, means this model prices at FALLBACK.
+    card = ratecard.load(aws_clients["budgets"])
+    priced_usage = pricing.price(usage, model_id, card.rate_for(model_id) if card else None)
     day = ledger.utc_day()
 
     if ledger.claim_count(aws_clients["usage"], request_id):
@@ -146,6 +150,8 @@ def process_log_entry(message: str, aws_clients: dict) -> str:
         aws_clients,
         model_id=model_id,
         fallback=priced_usage.is_fallback,
+        stale_rates=bool(card and card.is_stale),
+        rates_fetched_at=card.fetched_at if card else None,
     )
     return outcome
 
@@ -158,10 +164,33 @@ def apply_budget_policy(
     *,
     model_id: str,
     fallback: bool,
+    stale_rates: bool = False,
+    rates_fetched_at: str | None = None,
 ) -> None:
     budget = budgets.load(aws_clients["budgets"], attribution.track)
     topic_arn = budget.notify_topic_arn or NOTIFY_TOPIC_ARN
     decision = enforce.evaluate(total, budget)
+
+    if stale_rates:
+        # Not per track: the card is one object, so this claims under _SYSTEM and
+        # pages once a day however many tracks are spending.
+        _send_notice_once(
+            aws_clients,
+            topic_arn,
+            track="_SYSTEM",
+            day=day,
+            kind="RATECARD_STALE",
+            subject="[Bedrock] rate card has not refreshed in weeks",
+            body={
+                "fetched_at": rates_fetched_at,
+                "stale_after_days": ratecard.STALE_AFTER_DAYS,
+                "action": (
+                    "The weekly refresh has stopped landing, so every budget is "
+                    "being evaluated against prices that may have moved. Check the "
+                    "bedrock-cost-limits-refresh-rates function and its DLQ."
+                ),
+            },
+        )
 
     if budget.is_floor:
         _send_notice_once(
@@ -173,7 +202,6 @@ def apply_budget_policy(
             subject=f"[Bedrock] {attribution.track} has no budget row",
             body={
                 "track": attribution.track,
-                "owner": attribution.owner,
                 "applied_daily_usd": _format_usd(budget.daily_micros),
                 "action": (
                     "A conservative floor is being applied so the track is not "
@@ -193,7 +221,11 @@ def apply_budget_policy(
             body={
                 "track": attribution.track,
                 "model_id": model_id,
-                "action": "charged at the fallback rate; add it to the rate card",
+                "action": (
+                    "No RATECARD# row for this model, so it is charged at the "
+                    "deliberately high fallback rate. Either the weekly refresh has "
+                    "not run, or the model needs a line in pricelist.MODEL_IDS."
+                ),
             },
         )
 
@@ -208,8 +240,6 @@ def apply_budget_policy(
             f"[Bedrock] {attribution.track} at {threshold_pct}% of daily budget",
             {
                 "track": attribution.track,
-                "owner": attribution.owner,
-                "env": attribution.env,
                 "day": day,
                 "threshold_pct": threshold_pct,
                 # The gap between the threshold and the real figure is the
@@ -271,7 +301,6 @@ def disable_track(
             subject=f"[Bedrock] cannot stop {attribution.track} - no access key",
             body={
                 "track": attribution.track,
-                "owner": attribution.owner,
                 "principal": principal.name,
                 "principal_kind": principal.kind,
                 "spent_usd": _format_usd(total),
@@ -323,8 +352,6 @@ def disable_track(
         f"[Bedrock] DISABLED {attribution.track} - runaway spend",
         {
             "track": attribution.track,
-            "owner": attribution.owner,
-            "env": attribution.env,
             "day": day,
             "spent_usd": _format_usd(total),
             "daily_budget_usd": _format_usd(budget.daily_micros),

@@ -5,7 +5,7 @@ from __future__ import annotations
 from decimal import Decimal, ROUND_HALF_UP
 from typing import NamedTuple
 
-__all__ = ["Rates", "Usage", "PricedUsage", "price", "usage_from_log", "RATES", "FALLBACK"]
+__all__ = ["Rates", "Usage", "PricedUsage", "price", "usage_from_log", "FALLBACK"]
 
 
 class Rates(NamedTuple):
@@ -43,34 +43,9 @@ def _rate(value: str) -> Decimal:
     return Decimal(value)
 
 
-# USD per million tokens, on-demand, us-east-1. THESE MUST BE VERIFIED against
-# https://aws.amazon.com/bedrock/pricing/ before enforcement is switched on, and
-# reconciled monthly thereafter. See README.md, the watch-only week.
-#
-# Four rates per model, not two: cache reads bill at a tenth of input and these
-# workloads lean on caching, so collapsing them overstates the expensive flows.
-RATES: dict[str, Rates] = {
-    "anthropic.claude-sonnet-4-5-20250929-v1:0": Rates(
-        input=_rate("3.00"),
-        output=_rate("15.00"),
-        cache_read=_rate("0.30"),
-        cache_write=_rate("3.75"),
-    ),
-    "anthropic.claude-haiku-4-5-20251001-v1:0": Rates(
-        input=_rate("1.00"),
-        output=_rate("5.00"),
-        cache_read=_rate("0.10"),
-        cache_write=_rate("1.25"),
-    ),
-    "anthropic.claude-opus-4-1-20250805-v1:0": Rates(
-        input=_rate("15.00"),
-        output=_rate("75.00"),
-        cache_read=_rate("1.50"),
-        cache_write=_rate("18.75"),
-    ),
-}
-
-# Unlisted model. Deliberately above Opus: raising would leave the invocation
+# The only rates in this file. Used when the rate card has no row for a model --
+# because it is new, because MODEL_IDS has no line for it, or because no refresh
+# has run yet. Deliberately expensive: raising instead would leave the invocation
 # unrecorded, which is an unlimited budget. `is_fallback` drives a daily alert.
 FALLBACK = Rates(
     input=_rate("20.00"),
@@ -92,18 +67,13 @@ def normalize_model_id(model_id: str) -> str:
     return normalized
 
 
-def lookup(model_id: str, region: str | None = None) -> tuple[Rates, str, bool]:
-    """Return (rates, rate_card_key, is_fallback). `region` is accepted but unused."""
-    key = normalize_model_id(model_id)
-    rates = RATES.get(key)
-    if rates is None:
-        return FALLBACK, "FALLBACK", True
-    return rates, key, False
-
-
-def price(usage: Usage, model_id: str, region: str | None = None) -> PricedUsage:
+def price(usage: Usage, model_id: str, rates: Rates | None = None) -> PricedUsage:
     """Cost of one invocation in micro-USD. tokens * usd_per_million, no division."""
-    rates, rate_card_key, is_fallback = lookup(model_id, region)
+    # None means the rate card has no row for this model. There is no second card
+    # to try: FALLBACK is the answer, and it is loud.
+    is_fallback = rates is None
+    rate_card_key = normalize_model_id(model_id) if rates is not None else "FALLBACK"
+    rates = FALLBACK if rates is None else rates
     total_micros = (
         Decimal(usage.input_tokens) * rates.input
         + Decimal(usage.output_tokens) * rates.output

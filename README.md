@@ -23,20 +23,21 @@ deployed in `us-east-1`. Start with the one region your tracks actually use.
 
 ---
 
-## The nine steps, in order
+## The ten steps, in order
 
 The order matters in two places, called out as you reach them.
 
 ```
-1. make test                     prove the code works, no AWS needed
-2. sam deploy                    create everything
-3. confirm the alert email       a human clicks a link
-4. tag the IAM users             ← MUST be before step 6
-5. create the log group + role
-6. enable invocation logging     ← the spend starts being seen here
-7. seed the budget table
-8. watch for a week              enforce stays false
-9. make enforce TRACK=...        one track at a time
+ 1. make test                     prove the code works, no AWS needed
+ 2. sam deploy                    create everything
+ 3. confirm the alert email       a human clicks a link
+ 4. tag the IAM users             ← MUST be before step 6
+ 5. create the log group + role
+ 6. enable invocation logging     ← the spend starts being seen here
+ 7. seed the budget table
+ 8. make refresh-rates            fetch real prices once, now
+ 9. watch for a week              enforce stays false
+10. make enforce TRACK=...        one track at a time
 ```
 
 ---
@@ -70,6 +71,8 @@ You will be asked for these. The ones that matter are in bold.
 | **`BedrockLogGroupName`** | press Enter for `/aws/bedrock/modelinvocations` | you create this in step 5 |
 | **`PrincipalNamePattern`** | e.g. `BedrockDev-*` | **the IAM users this may touch** — see below |
 | **`AlertEmail`** | your email | optional, but then nothing alerts |
+| `RateRegion` | press Enter for `us-east-1` | the region whose Bedrock prices you are charged at |
+| `MaxRateDeltaPct` | press Enter for `25` | refuse a refreshed price that moves more than this |
 | Confirm changes before deploy | `y` | shows you the changeset first |
 | Allow SAM CLI IAM role creation | `Y` | it needs to make the Lambda roles |
 | Save arguments to configuration file | `Y` | so later deploys are just `sam deploy` |
@@ -79,18 +82,21 @@ You will be asked for these. The ones that matter are in bold.
 > a bug could deactivate *anyone's* access key, including yours. Use a prefix
 > that only your Bedrock keys have.
 
-This creates nine things:
+This creates eleven things:
 
 ```
-bedrock_usage                       DynamoDB table (+ one index, + auto-expiry)
-bedrock_budgets                     DynamoDB table
-bedrock-cost-limits-alerts            SNS topic
-  └─ your email                     SNS subscription (if you gave one)
-bedrock-cost-limits-meter-dlq         SQS queue, for batches that fail
-bedrock-cost-limits-meter             Lambda — the meter
-bedrock-cost-limits-unblock           Lambda — the release
-bedrock-cost-limits-meter-errors      CloudWatch alarm
-bedrock-cost-limits-meter-dlq-not-empty   CloudWatch alarm
+bedrock_usage                              DynamoDB table (+ one index, + auto-expiry)
+bedrock_budgets                            DynamoDB table
+bedrock-cost-limits-alerts                 SNS topic
+  └─ your email                            SNS subscription (if you gave one)
+bedrock-cost-limits-meter-dlq              SQS queue, for batches that fail
+bedrock-cost-limits-meter                  Lambda — the meter
+bedrock-cost-limits-unblock                Lambda — the release
+bedrock-cost-limits-refresh-rates          Lambda — the weekly price refresh
+  └─ bedrock-cost-limits-rate-refresh      EventBridge schedule, rate(7 days)
+bedrock-cost-limits-meter-errors           CloudWatch alarm
+bedrock-cost-limits-meter-dlq-not-empty    CloudWatch alarm
+bedrock-cost-limits-rate-refresh-errors    CloudWatch alarm
 ```
 
 Note the values you will need later:
@@ -140,16 +146,15 @@ six keys, six tags.
 
 ```bash
 aws iam tag-user --user-name BedrockDev-camunda-to-temporal \
-  --tags Key=Track,Value=camunda_to_temporal \
-         Key=Owner,Value=platform-team \
-         Key=Env,Value=dev
+  --tags Key=Track,Value=camunda_to_temporal
 ```
 
 | Tag | Required | Used for |
 | --- | --- | --- |
 | `Track` | **yes** | the budget boundary and the ledger key |
-| `Owner` | no | appears in alerts, so you know who to call |
-| `Env` | no | appears in alerts, so you know if it is prod |
+
+`Track` is the only tag read. Any others you set are ignored — not cached, not
+carried into alerts. One attribution dimension, nothing to keep in sync.
 
 Then check nothing is missed:
 
@@ -259,7 +264,25 @@ make seed-track TRACK=memcached_to_elasticache DAILY_USD=30
 Both write `enforce: false`. See [the budget table](#bedrock_budgets) below for
 what each field does.
 
-### Step 8 — watch for a week
+### Step 8 — fetch the prices  ⚠️ not optional
+
+```bash
+make refresh-rates
+make rates          # read back what it stored
+```
+
+**There are no prices in the code.** Until this runs, every model prices at the
+fallback rate — about 6.7× Sonnet — so budgets trip early and you get a daily
+"unpriced model" email. Nothing is under-counted, but the numbers are wrong.
+
+After this, a Lambda refreshes them from the AWS Price List API **every 7 days**
+on its own. The schedule's first firing is seven days after deploy, which is why
+this step exists.
+
+See [the rate card](#the-rate-card) for how it is stored, what it refuses, and
+what to do when a model comes back unpriced.
+
+### Step 9 — watch for a week
 
 Do not skip this. The price list in `src/pricing.py` was typed by hand from
 AWS's pricing page and **has not been checked against a real bill**. If a rate is
@@ -301,7 +324,7 @@ camunda_to_temporal past the disable ceiling at 76.4012 USD (ceiling 75.0000), b
 That line is the point of the week — exactly what *would* have happened, with
 the real number, without doing it.
 
-### Step 9 — turn on enforcement
+### Step 10 — turn on enforcement
 
 One track at a time.
 
@@ -314,6 +337,152 @@ make watch TRACK=camunda_to_temporal
 
 From now on, that track passing `daily_usd × runaway_multiple` deactivates its
 access keys and pages you. It will not come back on its own.
+
+---
+
+## The rate card
+
+**There are no prices in the code.** `src/pricing.py` holds one rate — the
+fallback — and nothing else. Every real price comes from a row in
+`bedrock_budgets`, refreshed from the AWS Price List API every seven days.
+
+```
+EventBridge  rate(7 days)
+     │
+     ▼
+bedrock-cost-limits-refresh-rates
+     │  1. read RATECARD#CURRENT
+     │  2. pricing:GetProducts  (AmazonBedrock, one region)
+     │  3. validate the whole card          ← nothing is written before this passes
+     │  4. rotate the two rows
+     ▼
+bedrock_budgets
+  RATECARD#CURRENT        ← the meter reads this
+  RATECARD#2026-10-07     ← the card CURRENT replaced
+```
+
+> **Run `make refresh-rates` once immediately after deploying.** The schedule
+> first fires seven days later. Until a card exists, **every model prices at the
+> fallback rate** — $20/$100/$2/$25 per million, roughly 6.7× Sonnet. Nothing is
+> ever under-counted, but budgets will trip early and you will get a daily
+> "unpriced model" email until you run it.
+
+The meter reads `RATECARD#CURRENT` once per container per 15 minutes, not once
+per log line.
+
+### Exactly two rows, always
+
+Each refresh rotates them:
+
+| Before (14 Oct) | After |
+| --- | --- |
+| `RATECARD#CURRENT` — fetched 7 Oct | `RATECARD#CURRENT` — fetched 14 Oct |
+| `RATECARD#2026-09-30` | `RATECARD#2026-10-07` — the card just replaced |
+
+The outgoing `CURRENT` is kept under the date **it** was fetched, and the row
+before that is deleted. `CURRENT` carries a `previous_scope` attribute naming the
+dated row, which is how the next run knows what to delete. Nothing accumulates.
+
+### How a card is stored
+
+```json
+{
+  "scope": "RATECARD#CURRENT",
+  "fetched_at": "2026-10-14T03:00:11+00:00",
+  "source": "AmazonBedrock:us-east-1",
+  "region": "us-east-1",
+  "previous_scope": "RATECARD#2026-10-07",
+  "models": {
+    "anthropic.claude-sonnet-4-5-20250929-v1:0": {
+      "input": 3.0, "output": 15.0, "cache_read": 0.3, "cache_write": 3.75
+    },
+    "anthropic.claude-haiku-4-5-20251001-v1:0": {
+      "input": 1.0, "output": 5.0, "cache_read": 0.1, "cache_write": 1.25
+    }
+  }
+}
+```
+
+`models` is keyed by the exact `modelId` from the invocation log, after any
+`us.` / `eu.` geography prefix is stripped. Rates are USD per **million** tokens,
+stored as DynamoDB numbers.
+
+A model that is **not** in `models` prices at the fallback and sends a daily
+email. That is the only "we don't know this price" path in the system.
+
+### Validation runs before anything is written
+
+A wrong card mis-meters every track at once, so the whole card has to pass four
+checks first. If any check fails, **nothing is written at all** — no new row, no
+rotation, no deletion — and the meter carries on with the card it already had.
+
+| Check | Catches |
+| --- | --- |
+| every rate above zero, all four classes present | a half-parsed card; a zero rate is an unlimited budget |
+| `cache_read` ≤ `input` | the token-class mix-up — cache reads bill at ~1/10 of input |
+| no rate moves more than `MaxRateDeltaPct` (default 25%) | a price quoted per 1K tokens read as per million: a 1000× error |
+| `input` and `output` both present per model | half a card, which would under-count every reply |
+
+You get **`[Bedrock] rate card REJECTED — prices not updated`**, and the email
+carries `stored` and `fetched` side by side, so there is nothing to go and diff.
+
+If a >25% move is genuine, raise `MaxRateDeltaPct` for one run, or write the new
+numbers onto `RATECARD#CURRENT` by hand.
+
+A model that **disappears** from the price list is not a rejection — the fetched
+card is merged over the current one, so it keeps its last known price instead of
+dropping to the fallback. Same reasoning as a partial budget row inheriting
+`DEFAULT`.
+
+### The one thing that is not automatic
+
+**The Price List API does not carry the Bedrock `modelId`.** It returns a model
+*name* (`Claude Sonnet 4.5`) and a usage type (`USE1-CacheReadInputTokenCount`).
+The log line carries `anthropic.claude-sonnet-4-5-20250929-v1:0`. Those are
+joined by a table in `src/pricelist.py`:
+
+```python
+MODEL_IDS = {
+    "claude sonnet 4 5": "anthropic.claude-sonnet-4-5-20250929-v1:0",
+    ...
+}
+```
+
+A **new model needs one line there**, and its four prices then track weekly on
+their own. Until that line exists the model prices at the fallback and the
+refresh emails you a "refreshed with gaps" notice naming what it could not map.
+
+### What can go wrong, and what tells you
+
+| Symptom | Means | Alert |
+| --- | --- | --- |
+| `[Bedrock] rate card REJECTED` | a fetch failed validation; nothing was written | SNS, once a day |
+| `[Bedrock] rate card refreshed with gaps` | a model name has no `MODEL_IDS` line | SNS, once a day |
+| `[Bedrock] rate card has not refreshed in weeks` | no successful refresh for 30 days | SNS, once a day, all tracks |
+| `[Bedrock] unpriced model used by <track>` | that model is not on the card | SNS, once a day per model |
+| `bedrock-cost-limits-rate-refresh-errors` | the function itself failed | CloudWatch alarm |
+| `make rates` returns nothing | no card at all — **everything is at the fallback** | log line only |
+
+### Permissions
+
+The refresher holds `pricing:GetProducts` (read-only; the public price list has
+no resource ARNs, so it cannot be narrowed below `*`) and a DynamoDB grant
+**conditioned on the `RATECARD#` key prefix**:
+
+```yaml
+Condition:
+  ForAllValues:StringLike:
+    dynamodb:LeadingKeys: ["RATECARD#*"]
+```
+
+It can rewrite prices. It cannot touch a budget row, and it holds no IAM
+permission at all — it can never deactivate a key.
+
+### Region
+
+Bedrock prices differ by region; this control prices everything at one of them,
+set by the `RateRegion` parameter (default `us-east-1`). The Price List API is
+itself called in `us-east-1` regardless, because it is not offered everywhere.
 
 ---
 
@@ -370,7 +539,7 @@ deactivate its key; a zero budget disables the limit rather than the track.
 
 > ⚠️ **Do not set `notify_topic_arn` yet.** The override works, but nothing
 > checks that the topic you name has a confirmed subscriber — and publishing to a
-> topic with no subscribers *succeeds silently*. See `TODO.md` item 22.
+> topic with no subscribers *succeeds silently*.
 
 ### `bedrock_usage`
 
@@ -462,8 +631,7 @@ which user.
 ```
 pk = ARN#arn:aws:iam::123456789012:user/BedrockDev-camunda-to-temporal
 sk = TAGS
-{ "track": "camunda_to_temporal", "owner": "platform-team", "env": "dev",
-  "ttl": 1791441445 }                            ← 24 hours
+{ "track": "camunda_to_temporal", "ttl": 1791441445 }   ← 24 hours
 ```
 
 So IAM is not asked on every log line. Rebuilds itself automatically.
@@ -502,9 +670,12 @@ what `make status` queries — one lookup, no table scan.
 | the logging role | `aws iam create-role` | step 5 |
 | `DEFAULT` budget | `make seed DAILY_USD=25` | step 7 |
 | a track's budget | `make seed-track TRACK=... DAILY_USD=...` | step 7 |
-| enforcement on/off | `make enforce` / `make watch` | step 9 |
+| the first price fetch | `make refresh-rates` | step 8 |
+| a new model's id mapping | one line in `src/pricelist.py` | when a gaps email arrives |
+| enforcement on/off | `make enforce` / `make watch` | step 10 |
 
-Everything except the tags and the budget rows is set once at deploy.
+Everything except the tags, the budget rows and the model-id mapping is set once
+at deploy. Prices refresh themselves.
 
 ---
 
@@ -523,31 +694,36 @@ receives all of this.
 | `<track> has no budget row` | the $10 floor was applied | once per day | track's, else default |
 | `unpriced model used by <track>` | that model is not in the price list | once per day **per model** | track's, else default |
 | `cannot stop <track> — no access key` | past the ceiling, nothing to deactivate | once per day | track's, else default |
+| `rate card REJECTED — prices not updated` | a fetch failed validation; nothing was written | once per day | **always the default** |
+| `rate card refreshed with gaps` | a model name has no `MODEL_IDS` line | once per day | **always the default** |
+| `rate card has not refreshed in weeks` | no successful refresh for 30 days | once per day, all tracks | track's, else default |
 | **`bedrock-cost-limits-meter-errors`** | the meter itself failed | per 5-minute window | **always the default** |
 | **`bedrock-cost-limits-meter-dlq-not-empty`** | a batch gave up after retries | per 5-minute window | **always the default** |
+| **`bedrock-cost-limits-rate-refresh-errors`** | the price refresh itself failed | per 5-minute window | **always the default** |
 
 "track's, else default" means: the track's budget row can name its own topic, and
 if it does not, the stack's topic is used. **Right now no row should name one**
-(see `TODO.md` item 22), so in practice everything lands on the stack topic.
+— an alert published to a topic with no subscribers succeeds silently — so in
+practice everything lands on the stack topic.
 
-The last two are AWS watching AWS — CloudWatch alarms do not read your budget
-table, so they can never be routed per track. That is correct: "the meter is
-broken" is a platform problem, not one track's problem.
+The bold ones are AWS watching AWS, or this control watching itself — neither
+reads your budget table, so they can never be routed per track. That is correct:
+"the meter is broken" and "prices are stale" are platform problems, not one
+track's problem.
 
-### The two alarms mean different things
+### The three alarms mean different things
 
 | Alarm | Severity |
 | --- | --- |
 | `meter-errors` | something failed; AWS is retrying automatically, probably fine |
 | `meter-dlq-not-empty` | something **gave up**. That spend is **not in the ledger**, so every budget and ceiling for the affected tracks is reading low |
+| `rate-refresh-errors` | prices did not refresh. Nothing stops — the meter keeps using the stored card — but every budget drifts from what AWS actually charges until it is fixed |
 
 ### What a budget alert looks like
 
 ```json
 {
   "track": "camunda_to_temporal",
-  "owner": "platform-team",
-  "env": "dev",
   "day": "2026-10-08",
   "threshold_pct": 80,
   "actual_pct": "92.9",
@@ -593,9 +769,12 @@ The runbook is in the alert, so nobody has to go looking for it at 9pm.
 make status                                   # today's spend, every track
 make status DAY=2026-10-07                    # a past day
 
-make seed-track TRACK=<name> DAILY_USD=<n>        # add or reset a track's budget
+make seed-track TRACK=<name> DAILY_USD=<n>    # add or reset a track's budget
 make enforce TRACK=<name>                     # arm enforcement for one track
 make watch   TRACK=<name>                     # disarm it
+
+make rates                                    # the prices the meter is using
+make refresh-rates                            # fetch prices now, not in 7 days
 
 make unblock TRACK=<name> REASON='...'        # re-enable a disabled track
 make test                                     # after any code change
@@ -648,7 +827,11 @@ make unblock TRACK=camunda_to_temporal REASON='wave-7f3a21 loop fixed, retry cap
 | `make status` shows nothing | no spend today, or the log group name in the stack does not match the one Bedrock writes to |
 | Error alarm firing constantly | an IAM user is missing its `Track` tag (step 4) |
 | Daily "has no budget row" email | that track needs `make seed-track`, or a `DEFAULT` row |
-| Daily "unpriced model" email | that model is not in `src/pricing.py` — see `TODO.md` item 4 |
+| Daily "unpriced model" email | no card at all (run `make refresh-rates`), or that model has no `MODEL_IDS` line in `src/pricelist.py` |
+| "rate card REJECTED" email | a refreshed price moved more than `MaxRateDeltaPct`; nothing was written and the old card is still in use |
+| "rate card has not refreshed in weeks" | the weekly refresh is failing — check `bedrock-cost-limits-refresh-rates` |
+| `make rates` returns nothing | **no card at all — everything is pricing at the fallback.** Run `make refresh-rates` |
+| Every track's spend looks ~6× too high | same thing: no card, so the fallback rate is being applied |
 | No emails at all, ever | the subscription was never confirmed (step 3) |
 | Spend recorded but nothing enforced | `enforce` is still `false` — that is the default, by design |
 | "cannot stop — no access key" | that track runs under a role, which has no key to deactivate |

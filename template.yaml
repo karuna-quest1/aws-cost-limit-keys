@@ -30,6 +30,22 @@ Parameters:
     Default: ""
     Description: Optional. Subscribed to the alert topic on create.
 
+  RateRegion:
+    Type: String
+    Default: us-east-1
+    Description: >
+      The region whose Bedrock prices the meter charges at. Bedrock prices differ
+      by region; this control prices everything at one of them.
+
+  MaxRateDeltaPct:
+    Type: String
+    Default: "25"
+    Description: >
+      A refreshed rate that moves more than this against the stored card is
+      refused and paged rather than promoted. It is the check that catches a
+      price quoted per 1K tokens being read as per million -- a 1000x error in
+      every budget. Set it to 0 to make every refresh require a manual promote.
+
 Conditions:
   HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
 
@@ -210,6 +226,59 @@ Resources:
               Action: [iam:UpdateAccessKey]
               Resource: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:user/${PrincipalNamePattern}
 
+  # --- weekly rate card refresh --------------------------------------------
+  RefreshRatesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: bedrock-cost-limits-refresh-rates
+      Handler: refresh_rates.handler
+      Description: >
+        Fetches Bedrock on-demand token prices from the AWS Price List API every
+        seven days, validates them against the stored card, and promotes them.
+
+        It cannot promote a card that fails validation, and it cannot write a
+        budget row: the DynamoDB grant below is conditioned on the RATECARD#
+        key prefix. The meter reads the promoted card through its existing
+        read-only grant on this table.
+      # Paginating a whole service price list is slower and larger than anything
+      # else in this stack, and it runs once a week.
+      Timeout: 300
+      MemorySize: 512
+      ReservedConcurrentExecutions: 1
+      Environment:
+        Variables:
+          RATE_REGION: !Ref RateRegion
+          PRICE_LIST_REGION: us-east-1
+          MAX_RATE_DELTA_PCT: !Ref MaxRateDeltaPct
+      Events:
+        Weekly:
+          Type: Schedule
+          Properties:
+            Name: bedrock-cost-limits-rate-refresh
+            Schedule: rate(7 days)
+            Description: Refresh the Bedrock rate card.
+      Policies:
+        # The Price List API publishes no resource ARNs, so this cannot be
+        # narrowed below "*". It is read-only and account-agnostic: it returns
+        # the public price list, not anything about this account.
+        - Statement:
+            - Effect: Allow
+              Action: [pricing:GetProducts, pricing:DescribeServices]
+              Resource: "*"
+            - Effect: Allow
+              Action: [sns:Publish]
+              Resource: !Ref AlertTopic
+            # Rate card rows only. Without the condition this function could
+            # rewrite a track's budget, which is the one thing it must not do.
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:PutItem]
+              Resource: !GetAtt BudgetTable.Arn
+              Condition:
+                ForAllValues:StringLike:
+                  dynamodb:LeadingKeys: ["RATECARD#*"]
+        # The once-a-day claim that stops a retry re-sending the gaps email.
+        - DynamoDBCrudPolicy: { TableName: !Ref UsageTable }
+
   # --- alarms --------------------------------------------------------------
   MeterErrorAlarm:
     Type: AWS::CloudWatch::Alarm
@@ -250,11 +319,34 @@ Resources:
       TreatMissingData: notBreaching
       AlarmActions: [!Ref AlertTopic]
 
+  RefreshRatesErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: bedrock-cost-limits-rate-refresh-errors
+      AlarmDescription: >
+        The weekly price refresh failed. The meter keeps pricing with the card
+        already stored, so nothing stops -- but the longer this is broken the
+        further every budget drifts from what AWS actually charges. A rejected
+        card pages on its own; this covers the failures that never got that far.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{ Name: FunctionName, Value: !Ref RefreshRatesFunction }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
 Outputs:
   UsageTableName: { Value: !Ref UsageTable }
   BudgetTableName: { Value: !Ref BudgetTable }
   AlertTopicArn: { Value: !Ref AlertTopic }
   MeterDeadLetterQueueUrl: { Value: !Ref MeterDeadLetterQueue }
+  RefreshRatesCommand:
+    Description: Run the price refresh now instead of waiting for the schedule.
+    Value: !Sub aws lambda invoke --function-name ${RefreshRatesFunction} /dev/stdout
   UnblockCommand:
     Description: How the on-call rota re-enables a track.
     Value: !Sub >-

@@ -141,8 +141,18 @@ which key gets deactivated. An untagged user raises an error on **every log line
 it produces**, which fires the error alarm continuously and fills the
 dead-letter queue with batches that can never succeed.
 
-**One key per track** is the rule this assumes. Six tracks means six IAM users,
-six keys, six tags.
+**Several IAM users may share one track.** When the track crosses its ceiling,
+every active key belonging to every user on it is deactivated together, and a
+user that starts spending on an already-disabled track is switched off on its
+first call. `make unblock` reverses exactly what was recorded.
+
+> **Give each of these users one key, used only for Bedrock.** Enforcement works
+> at the granularity of the *IAM user*, not the key — the invocation log carries
+> an ARN and no key id, so there is no way to know which of a user's keys made
+> the call. Every active key that user holds is switched off. A key that is also
+> doing S3 or DynamoDB work stops with it.
+
+See `KNOWN_ISSUE_shared_track_tag.md` for the full set of guarantees and limits.
 
 ```bash
 aws iam tag-user --user-name BedrockDev-camunda-to-temporal \
@@ -602,7 +612,8 @@ sk = DAY#2026-10-08#NOTICE#NO_BUDGET
 
 Holds nothing. Its *existence* is the message: "someone already sent this
 warning today." Without it, a track with no budget row would email you once per
-Bedrock call. Three kinds: `NO_BUDGET`, `FALLBACK#<modelId>`, `UNENFORCEABLE`.
+Bedrock call. Five kinds: `NO_BUDGET`, `FALLBACK#<modelId>`, `UNENFORCEABLE`,
+`RATECARD_STALE`, and `DISABLE_EXTENDED#<user>`.
 
 **3. The disabled record**
 
@@ -613,11 +624,16 @@ sk = DISABLED
   "disabled_at":      "2026-10-08T10:29:50+00:00",
   "disabled_day":     "2026-10-08",
   "spend_at_disable": 309750,
-  "principals":       ["BedrockDev-camunda-to-temporal"],
-  "keys":             ["BedrockDev-camunda-to-temporal/AKIAEXAMPLE1",
-                       "BedrockDev-camunda-to-temporal/AKIAEXAMPLE2"]
+  "principals":       ["BedrockDev-camunda-a", "BedrockDev-camunda-b"],
+  "keys":             ["BedrockDev-camunda-a/AKIAEXAMPLE1",
+                       "BedrockDev-camunda-a/AKIAEXAMPLE2",
+                       "BedrockDev-camunda-b/AKIAEXAMPLE3"]
 }
 ```
+
+`keys` stores pre-paired `user/key-id` strings, never two independent sets —
+pairing them later would mean calling `UpdateAccessKey` with mismatched owners.
+Both sets grow if a user appears on the track after it was disabled.
 
 **No expiry** — the only record here without one. If it expired you would have a
 dead access key and nothing explaining what killed it. Deleted only by a human

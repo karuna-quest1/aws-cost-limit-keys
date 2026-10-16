@@ -25,10 +25,12 @@ __all__ = [
     "release_count",
     "accumulate",
     "current_total",
+    "read_user_principals",
     "claim_threshold",
     "claim_notice",
     "claim_disable",
     "release_disable",
+    "extend_disable",
     "is_disabled",
     "read_disabled",
     "clear_disabled",
@@ -93,11 +95,18 @@ def release_count(table, request_id: str) -> None:
 # The meter
 # ---------------------------------------------------------------------------
 
-_ACCUMULATE_EXPRESSION = (
+_ACCUMULATE_ADD = (
     "ADD spent_micros :micros, in_tokens :input_tokens, out_tokens :output_tokens, "
     "cache_read_tokens :cache_read_tokens, cache_write_tokens :cache_write_tokens, "
-    "calls :one_call "
-    "SET #day = :day, #ttl = :ttl, "
+    "calls :one_call"
+)
+# Only IAM users have a key that can be deactivated, so only they are recorded
+# here. This is the list the disable path works from -- `by_principal` carries
+# roles too and cannot tell them apart. Left out entirely for a role, because
+# DynamoDB rejects an empty set.
+_ACCUMULATE_USER = ", user_principals :user_principal"
+_ACCUMULATE_SET = (
+    " SET #day = :day, #ttl = :ttl, "
     "by_model.#model = if_not_exists(by_model.#model, :zero) + :micros, "
     "by_principal.#principal = if_not_exists(by_principal.#principal, :zero) + :micros"
 )
@@ -129,6 +138,7 @@ def accumulate(
     day: str,
     model_id: str,
     principal_name: str,
+    principal_kind: str,
     usage,
     micros: int,
     now: float | None = None,
@@ -139,9 +149,12 @@ def accumulate(
     # contains dots, which an expression would read as a nested path.
     now = time.time() if now is None else now
     key = day_key(track, day)
+    is_user = principal_kind == "user"
     update_args = dict(
         Key=key,
-        UpdateExpression=_ACCUMULATE_EXPRESSION,
+        UpdateExpression=(
+            _ACCUMULATE_ADD + (_ACCUMULATE_USER if is_user else "") + _ACCUMULATE_SET
+        ),
         ExpressionAttributeNames={
             "#day": "day",
             "#ttl": "ttl",
@@ -158,6 +171,7 @@ def accumulate(
             ":zero": 0,
             ":day": day,
             ":ttl": int(now) + _ROW_TTL_SECONDS,
+            **({":user_principal": {principal_name}} if is_user else {}),
         },
         ReturnValues="UPDATED_NEW",
     )
@@ -199,6 +213,21 @@ def current_total(table, track: str, day: str) -> int:
     if not item:
         return 0
     return int(item.get("spent_micros", 0))
+
+
+def read_user_principals(table, track: str, day: str) -> set[str]:
+    """Every IAM user that has spent on this track today."""
+    # The disable path needs all of them, not just the one whose log line
+    # happened to cross the ceiling -- otherwise a track with two keys keeps
+    # spending through the one that was not switched off.
+    key = day_key(track, day)
+    try:
+        item = table.get_item(Key=key).get("Item")
+    except Exception as exc:
+        raise LedgerWriteFailed(f"could not read the day row {key}: {exc!r}") from exc
+    if not item:
+        return set()
+    return {str(name) for name in (item.get("user_principals") or set())}
 
 
 # ---------------------------------------------------------------------------
@@ -293,6 +322,41 @@ def release_disable(table, track: str) -> None:
     # Keeping it is the worst state reachable: the ledger says stopped, the key
     # still works, and the claim is one-shot so nothing retries.
     clear_disabled(table, track)
+
+
+def extend_disable(table, track: str, principal_keys: dict[str, set[str]]) -> None:
+    """Record keys switched off after the disable was already claimed."""
+    # For a user that started spending on an already-disabled track. Set ADD is
+    # idempotent, so a concurrent repeat is harmless, and attribute_exists keeps
+    # this from resurrecting a record that `unblock` has just cleared.
+    pairs = {
+        f"{user}/{key_id}"
+        for user, key_ids in principal_keys.items()
+        for key_id in key_ids
+    }
+    if not pairs:
+        return
+    try:
+        table.update_item(
+            Key={"pk": f"TRACK#{track}", "sk": "DISABLED"},
+            UpdateExpression="ADD #principals :principals, #keys :keys",
+            ConditionExpression="attribute_exists(pk)",
+            # Both are DynamoDB reserved words in an expression.
+            ExpressionAttributeNames={"#principals": "principals", "#keys": "keys"},
+            ExpressionAttributeValues={
+                ":principals": set(principal_keys),
+                ":keys": pairs,
+            },
+        )
+    except Exception as exc:
+        if is_conditional_check_failure(exc):
+            # Released or unblocked while we were working. The next log line
+            # over the ceiling takes the claim properly.
+            logger.warning("disabled record for %s vanished before extending it", track)
+            return
+        raise LedgerWriteFailed(
+            f"could not record the extra deactivated keys for {track}: {exc!r}"
+        ) from exc
 
 
 def is_disabled(table, track: str) -> bool:

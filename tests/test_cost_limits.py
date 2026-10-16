@@ -183,13 +183,14 @@ class TestLedgerAgainstRealDynamoSemantics(unittest.TestCase):
         self.table = FakeTable()
         self.usage = pricing.Usage(12_400, 850, 40_000, 0)
 
-    def _accumulate(self, micros=61_950, model_id=SONNET, principal=USER_NAME):
+    def _accumulate(self, micros=61_950, model_id=SONNET, principal=USER_NAME, kind="user"):
         return ledger.accumulate(
             self.table,
             track=TRACK,
             day="2026-10-06",
             model_id=model_id,
             principal_name=principal,
+            principal_kind=kind,
             usage=self.usage,
             micros=micros,
         )
@@ -266,6 +267,7 @@ class TestLedgerAgainstRealDynamoSemantics(unittest.TestCase):
                 day="2026-10-06",
                 model_id=SONNET,
                 principal_name=USER_NAME,
+                principal_kind="user",
                 usage=self.usage,
                 micros=61_950,
             )
@@ -1186,6 +1188,206 @@ def _epoch(stamp: str) -> float:
 
     return datetime.fromisoformat(stamp).timestamp()
 
+
+# --------------------------------------------------------------------------
+# 11. Several IAM users sharing one track. Enforcement must cover all of them.
+# --------------------------------------------------------------------------
+USER_X, USER_Y = "BedrockDev-share-x", "BedrockDev-share-y"
+ARN_X = f"arn:aws:iam::123456789012:user/{USER_X}"
+ARN_Y = f"arn:aws:iam::123456789012:user/{USER_Y}"
+
+
+class TestSharedTrackTag(WiredTestCase):
+    """One `Track` tag on two IAM users.
+
+    Before this was handled, only the user whose log line crossed the ceiling
+    was switched off. The other kept a live key while the ledger recorded the
+    track as DISABLED -- the ledger says stopped, the key still works.
+    """
+
+    def _wire(self, daily_usd="0.1", keys_y=("AKIA-Y1",)):
+        identity.reset_cache()
+        ratecard.reset_cache()
+        aws_clients = {
+            "usage": FakeTable(),
+            "budgets": budget_table(daily_usd, enforce_flag=True),
+            "iam": FakeIAM(
+                tags={USER_X: {"Track": TRACK}, USER_Y: {"Track": TRACK}},
+                access_keys={USER_X: ["AKIA-X1", "AKIA-X2"], USER_Y: list(keys_y)},
+            ),
+            "sns": FakeSNS(),
+        }
+        self._aws_clients = aws_clients
+        return aws_clients
+
+    @staticmethod
+    def _call(request_id, arn):
+        try:
+            handler.handler(
+                cloudwatch_event([log_entry(request_id=request_id, arn=arn)]), None
+            )
+        except errors.BatchIncomplete:
+            pass
+
+    def test_both_users_are_recorded_on_the_day_row(self):
+        aws_clients = self._wire()
+        self._call("x1", ARN_X)
+        self._call("y1", ARN_Y)
+        self.assertEqual(day_row(aws_clients)["user_principals"], {USER_X, USER_Y})
+
+    def test_a_role_is_not_recorded_as_a_deactivatable_user(self):
+        """Roles have no long-lived key, so they must not reach the IAM lookup."""
+        identity.reset_cache()
+        ratecard.reset_cache()
+        self._aws_clients = {
+            "usage": FakeTable(),
+            "budgets": budget_table("50", enforce_flag=True),
+            "iam": FakeIAM(tags={"ShinroRunner": {"Track": TRACK}}),
+            "sns": FakeSNS(),
+        }
+        self._call("r1", ARN_ASSUMED)
+        self.assertNotIn("user_principals", day_row(self._aws_clients))
+
+    def test_crossing_the_ceiling_deactivates_every_key_on_the_track(self):
+        """$0.06195 a call against a $0.10 day: the third call passes 1.5x."""
+        aws_clients = self._wire(daily_usd="0.1")
+        self._call("x1", ARN_X)   # $0.062
+        self._call("y1", ARN_Y)   # $0.124 - still under the $0.15 ceiling
+        self.assertEqual(aws_clients["iam"].deactivated, [])
+
+        self._call("x2", ARN_X)   # $0.186 - over
+
+        self.assertEqual(
+            sorted(aws_clients["iam"].deactivated),
+            [(USER_X, "AKIA-X1"), (USER_X, "AKIA-X2"), (USER_Y, "AKIA-Y1")],
+        )
+        record = aws_clients["usage"].items[(f"TRACK#{TRACK}", "DISABLED")]
+        self.assertEqual(record["principals"], {USER_X, USER_Y})
+        self.assertEqual(
+            record["keys"],
+            {f"{USER_X}/AKIA-X1", f"{USER_X}/AKIA-X2", f"{USER_Y}/AKIA-Y1"},
+        )
+
+    def test_the_disable_page_names_every_principal(self):
+        aws_clients = self._wire(daily_usd="0.1")
+        for request_id, arn in [("x1", ARN_X), ("y1", ARN_Y), ("x2", ARN_X)]:
+            self._call(request_id, arn)
+        page = [a for a in aws_clients["sns"].published if "DISABLED" in a["Subject"]][0]
+        self.assertIn(USER_X, page["Message"])
+        self.assertIn(USER_Y, page["Message"])
+
+    def test_a_user_that_appears_after_the_disable_is_switched_off_too(self):
+        """The claim is one-shot, so this is the only thing that can catch them."""
+        aws_clients = self._wire(daily_usd="0.01")  # the first call is already over
+        self._call("x1", ARN_X)
+        self.assertEqual(
+            sorted(aws_clients["iam"].deactivated), [(USER_X, "AKIA-X1"), (USER_X, "AKIA-X2")]
+        )
+
+        self._call("y1", ARN_Y)   # user Y shows up only now
+
+        self.assertIn((USER_Y, "AKIA-Y1"), aws_clients["iam"].deactivated)
+        record = aws_clients["usage"].items[(f"TRACK#{TRACK}", "DISABLED")]
+        self.assertEqual(record["principals"], {USER_X, USER_Y})
+        self.assertIn(f"{USER_Y}/AKIA-Y1", record["keys"])
+        subjects = [a["Subject"] for a in aws_clients["sns"].published]
+        self.assertEqual(sum(f"also DISABLED {USER_Y}" in s for s in subjects), 1)
+
+    def test_later_lines_do_not_keep_calling_iam(self):
+        """Inactive keys are filtered out, so the extension is a no-op after it runs."""
+        aws_clients = self._wire(daily_usd="0.01")
+        self._call("x1", ARN_X)
+        self._call("y1", ARN_Y)
+        before = len(aws_clients["iam"].deactivated)
+
+        for n in range(3):
+            self._call(f"y{n + 2}", ARN_Y)
+
+        self.assertEqual(len(aws_clients["iam"].deactivated), before)
+
+    def test_an_unblocked_track_is_not_resurrected_by_a_late_line(self):
+        """extend_disable is conditional on the record still existing."""
+        aws_clients = self._wire(daily_usd="0.01")
+        self._call("x1", ARN_X)
+        ledger.clear_disabled(aws_clients["usage"], TRACK)
+
+        ledger.extend_disable(aws_clients["usage"], TRACK, {USER_Y: {"AKIA-Y1"}})
+
+        self.assertNotIn((f"TRACK#{TRACK}", "DISABLED"), aws_clients["usage"].items)
+
+    def test_unblock_reactivates_every_key_the_disable_recorded(self):
+        """The release path pairs each key with its own owner, so it covers both."""
+        aws_clients = self._wire(daily_usd="0.1")
+        for request_id, arn in [("x1", ARN_X), ("y1", ARN_Y), ("x2", ARN_X)]:
+            self._call(request_id, arn)
+        self.assertEqual(len(aws_clients["iam"].deactivated), 3)
+
+        real_clients, real_topic = unblock.clients, unblock.NOTIFY_TOPIC_ARN
+        unblock._clients.clear()
+        unblock.clients = lambda: aws_clients
+        unblock.NOTIFY_TOPIC_ARN = TOPIC
+        try:
+            result = unblock.handler(
+                {"track": TRACK, "reason": "both keys rotated, loop cap added"}, None
+            )
+        finally:
+            unblock.clients, unblock.NOTIFY_TOPIC_ARN = real_clients, real_topic
+            unblock._clients.clear()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            sorted(aws_clients["iam"].activated),
+            [(USER_X, "AKIA-X1"), (USER_X, "AKIA-X2"), (USER_Y, "AKIA-Y1")],
+        )
+        self.assertNotIn((f"TRACK#{TRACK}", "DISABLED"), aws_clients["usage"].items)
+
+    def test_a_key_already_inactive_is_neither_recorded_nor_resurrected(self):
+        """Enforcement must not re-enable a key somebody switched off on purpose."""
+        aws_clients = self._wire(daily_usd="0.01")
+        aws_clients["iam"].access_keys[USER_X] = ["AKIA-X1", "AKIA-X2", "AKIA-X3"]
+        aws_clients["iam"].deactivated.append((USER_X, "AKIA-X3"))  # off last week
+
+        self._call("x1", ARN_X)
+
+        record = aws_clients["usage"].items[(f"TRACK#{TRACK}", "DISABLED")]
+        self.assertEqual(
+            record["keys"], {f"{USER_X}/AKIA-X1", f"{USER_X}/AKIA-X2"}
+        )  # X3 was never active, so it is not this control's to restore
+
+        real_clients, real_topic = unblock.clients, unblock.NOTIFY_TOPIC_ARN
+        unblock._clients.clear()
+        unblock.clients = lambda: aws_clients
+        unblock.NOTIFY_TOPIC_ARN = TOPIC
+        try:
+            unblock.handler({"track": TRACK, "reason": "loop fixed and capped"}, None)
+        finally:
+            unblock.clients, unblock.NOTIFY_TOPIC_ARN = real_clients, real_topic
+            unblock._clients.clear()
+
+        self.assertEqual(
+            dict(aws_clients["iam"]._keys_of(USER_X)),
+            {"AKIA-X1": "Active", "AKIA-X2": "Active", "AKIA-X3": "Inactive"},
+        )
+
+    def test_every_key_of_a_calling_user_goes_off_not_just_the_one_used(self):
+        """The invocation log carries an ARN and no key id, so this is per user."""
+        aws_clients = self._wire(daily_usd="0.01")
+        self._call("x1", ARN_X)
+        # USER_X called once; both of its keys are off, and USER_Y never called
+        self.assertEqual(
+            sorted(k for _, k in aws_clients["iam"].deactivated), ["AKIA-X1", "AKIA-X2"]
+        )
+        self.assertEqual(aws_clients["iam"]._keys_of(USER_Y), [("AKIA-Y1", "Active")])
+
+    def test_no_key_anywhere_on_the_track_still_refuses_to_claim(self):
+        aws_clients = self._wire(daily_usd="0.01", keys_y=())
+        aws_clients["iam"].access_keys[USER_X] = []
+
+        self._call("x1", ARN_X)
+
+        self.assertNotIn((f"TRACK#{TRACK}", "DISABLED"), aws_clients["usage"].items)
+        subjects = [a["Subject"] for a in aws_clients["sns"].published]
+        self.assertTrue(any("no access key" in s for s in subjects))
 
 if __name__ == "__main__":
     unittest.main()

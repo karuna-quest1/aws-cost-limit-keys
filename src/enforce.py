@@ -20,7 +20,14 @@ from errors import (
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["Decision", "evaluate", "notify", "deactivate_keys", "access_keys_for"]
+__all__ = [
+    "Decision",
+    "evaluate",
+    "notify",
+    "deactivate_keys",
+    "access_keys_for",
+    "access_keys_for_user",
+]
 
 _SNS_SUBJECT_LIMIT = 100
 
@@ -74,11 +81,18 @@ def access_keys_for(iam, principal) -> set[str]:
         # Roles issue temporary credentials, so there is nothing to deactivate.
         # A property of the credential type, not a failure.
         return set()
+    return access_keys_for_user(iam, principal.name)
+
+
+def access_keys_for_user(iam, user_name: str) -> set[str]:
+    """Active key ids for a name already known to be an IAM user."""
+    # Taken by name because the disable path works from the track's recorded
+    # users, where the kind was decided when the spend was accumulated.
     try:
-        response = iam.list_access_keys(UserName=principal.name)
+        response = iam.list_access_keys(UserName=user_name)
     except Exception as exc:
         raise KeyLookupFailed(
-            f"could not list access keys for {principal.name!r}, so there is no "
+            f"could not list access keys for {user_name!r}, so there is no "
             f"way to know what to deactivate: {exc!r}"
         ) from exc
     return {
@@ -88,27 +102,33 @@ def access_keys_for(iam, principal) -> set[str]:
     }
 
 
-def deactivate_keys(iam, user_name: str, access_key_ids: set[str]) -> set[str]:
-    """Deactivate, never delete. Returns the ids now inactive."""
+def deactivate_keys(iam, principal_keys: dict[str, set[str]]) -> set[str]:
+    """Deactivate every key of every user given. Returns the ids now inactive."""
     # Status="Active" is never passed from here, and that is the only thing
     # stopping this from undoing a disable: the IAM grant covers both directions
     # and IAM has no condition key for a key's status. A real boundary needs
     # this call in its own function holding that permission alone.
     #
-    # Every key is attempted before anything raises, so one throttled call
-    # cannot leave the rest live. A partial result still raises.
+    # Every key of every user is attempted before anything raises, so one
+    # throttled call cannot leave the rest live. A partial result still raises.
     deactivated, failures = set(), {}
-    for key_id in sorted(access_key_ids):
-        try:
-            iam.update_access_key(UserName=user_name, AccessKeyId=key_id, Status="Inactive")
-            deactivated.add(key_id)
-        except Exception as exc:
-            logger.error("could not deactivate %s for %s", key_id, user_name, exc_info=True)
-            failures[key_id] = repr(exc)
+    total = sum(len(key_ids) for key_ids in principal_keys.values())
+    for user_name in sorted(principal_keys):
+        for key_id in sorted(principal_keys[user_name]):
+            try:
+                iam.update_access_key(
+                    UserName=user_name, AccessKeyId=key_id, Status="Inactive"
+                )
+                deactivated.add(key_id)
+            except Exception as exc:
+                logger.error(
+                    "could not deactivate %s for %s", key_id, user_name, exc_info=True
+                )
+                failures[key_id] = repr(exc)
     if failures:
         raise DeactivationFailed(
-            f"{len(failures)} of {len(access_key_ids)} access keys for {user_name!r} are "
-            f"still active: {failures}",
+            f"{len(failures)} of {total} access keys across "
+            f"{sorted(principal_keys)} are still active: {failures}",
             deactivated=sorted(deactivated),
             still_active=sorted(failures),
         )

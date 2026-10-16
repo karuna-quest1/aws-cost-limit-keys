@@ -133,6 +133,7 @@ def process_log_entry(message: str, aws_clients: dict) -> str:
                 day=day,
                 model_id=model_id,
                 principal_name=attribution.principal.name,
+                principal_kind=attribution.principal.kind,
                 usage=usage,
                 micros=priced_usage.micros,
             )
@@ -287,19 +288,33 @@ def disable_track(
     aws_clients: dict,
 ) -> None:
     principal = attribution.principal
-    # Raises on failure: an empty set would be indistinguishable from "no keys".
-    key_ids = enforce.access_keys_for(aws_clients["iam"], principal)
+    # Every IAM user on the track, not just the one whose line crossed the
+    # ceiling. A track may have several keys, and switching off one of them
+    # leaves it spending through the rest while the ledger says it is stopped.
+    # The current principal is unioned in because the day row may not list it
+    # yet -- this line may be a duplicate whose spend was counted elsewhere.
+    user_names = ledger.read_user_principals(aws_clients["usage"], attribution.track, day)
+    if principal.kind == "user":
+        user_names.add(principal.name)
 
-    if not key_ids:
+    # Raises on failure: an empty set would be indistinguishable from "no keys".
+    principal_keys = {}
+    for user_name in sorted(user_names):
+        active = enforce.access_keys_for_user(aws_clients["iam"], user_name)
+        if active:
+            principal_keys[user_name] = active
+
+    if not principal_keys:
         # A role, or keys already inactive. Claiming here would record the track
         # as stopped while it kept spending, and the claim is one-shot.
         logger.error(
-            "%s is past the disable ceiling at %s USD but has no active access key to "
-            "deactivate (principal %s, kind %s)",
+            "%s is past the disable ceiling at %s USD but no principal on it has an "
+            "active access key to deactivate (tripped by %s, kind %s; users seen today %s)",
             attribution.track,
             _format_usd(total),
             principal.name,
             principal.kind,
+            sorted(user_names),
         )
         _send_notice_once(
             aws_clients,
@@ -310,8 +325,9 @@ def disable_track(
             subject=f"[Bedrock] cannot stop {attribution.track} - no access key",
             body={
                 "track": attribution.track,
-                "principal": principal.name,
-                "principal_kind": principal.kind,
+                "tripped_by": principal.name,
+                "tripped_by_kind": principal.kind,
+                "users_seen_today": sorted(user_names),
                 "spent_usd": _format_usd(total),
                 "ceiling_usd": _format_usd(budget.runaway_micros),
                 "action": (
@@ -329,15 +345,17 @@ def disable_track(
         aws_clients["usage"],
         track=attribution.track,
         day=day,
-        principal_keys={principal.name: key_ids},
+        principal_keys=principal_keys,
         spent_micros=total,
     ):
+        # Already disabled. A key that is still active now belongs to a user who
+        # started spending afterwards, so it has to be switched off too -- the
+        # claim is one-shot and would never fire again for it.
+        _extend_disable(aws_clients, attribution, day, topic_arn, principal_keys, total)
         return
 
     try:
-        deactivated_key_ids = enforce.deactivate_keys(
-            aws_clients["iam"], principal.name, key_ids
-        )
+        deactivated_key_ids = enforce.deactivate_keys(aws_clients["iam"], principal_keys)
     except errors.DeactivationFailed as exc:
         if not exc.deactivated:
             # Nothing switched off, so the claim is a lie. A track over its
@@ -365,7 +383,7 @@ def disable_track(
             "spent_usd": _format_usd(total),
             "daily_budget_usd": _format_usd(budget.daily_micros),
             "ceiling_usd": _format_usd(budget.runaway_micros),
-            "principal": principal.name,
+            "principals": sorted(principal_keys),
             "deactivated_access_keys": sorted(deactivated_key_ids),
             "release": (
                 "Does not reactivate on its own. On-call rota re-enables via the "
@@ -375,6 +393,53 @@ def disable_track(
         },
     )
     logger.error("DISABLED %s after %s USD", attribution.track, _format_usd(total))
+
+
+def _extend_disable(
+    aws_clients: dict,
+    attribution,
+    day: str,
+    topic_arn: str | None,
+    principal_keys: dict,
+    total: int,
+) -> None:
+    """Switch off a key that appeared after the track was already disabled."""
+    # No claim is taken first: the disabled record already exists, so there is
+    # nothing to claim. Deactivating is idempotent and the ledger write uses set
+    # ADD, so a concurrent repeat is harmless. The page is claimed per user
+    # AFTER the act, which keeps the rule that a claim is releasable or late.
+    if not principal_keys:
+        return
+
+    deactivated = enforce.deactivate_keys(aws_clients["iam"], principal_keys)
+    ledger.extend_disable(aws_clients["usage"], attribution.track, principal_keys)
+    logger.error(
+        "extended the disable on %s to %s after %s USD",
+        attribution.track,
+        sorted(principal_keys),
+        _format_usd(total),
+    )
+
+    for user_name in sorted(principal_keys):
+        _send_notice_once(
+            aws_clients,
+            topic_arn,
+            track=attribution.track,
+            day=day,
+            kind=f"DISABLE_EXTENDED#{user_name}",
+            subject=f"[Bedrock] also DISABLED {user_name} on {attribution.track}",
+            body={
+                "track": attribution.track,
+                "principal": user_name,
+                "deactivated_access_keys": sorted(principal_keys[user_name]),
+                "spent_usd": _format_usd(total),
+                "action": (
+                    "This track was already disabled when this principal started "
+                    "spending on it, so its key has been deactivated too. Several "
+                    "IAM users share this track's tag."
+                ),
+            },
+        )
 
 
 def _send_notice_once(

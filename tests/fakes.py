@@ -108,6 +108,14 @@ class FakeTable:
             if pct in (existing or {}).get("alerted", set()):
                 raise ConditionalCheckFailedException()
 
+        # An update guarded on the item existing must not create it.
+        if (
+            ConditionExpression
+            and "attribute_exists" in ConditionExpression
+            and existing is None
+        ):
+            raise ConditionalCheckFailedException()
+
         set_clause = UpdateExpression.split("SET", 1)[1] if "SET" in UpdateExpression else ""
 
         # A nested path may only be written when its parent map already exists on
@@ -141,7 +149,18 @@ class FakeTable:
                 if len(parts) != 2:
                     continue
                 attr, placeholder = parts
-                item[attr] = item.get(attr, 0) + values[placeholder]
+                attr = names.get(attr, attr)
+                value = values[placeholder]
+                if isinstance(value, (set, frozenset)):
+                    # ADD on a set is a union. DynamoDB rejects an empty one.
+                    assert value, f"ADD {attr} was given an empty set"
+                    current = item.get(attr)
+                    item[attr] = (
+                        set(current) | set(value) if isinstance(current, (set, frozenset))
+                        else set(value)
+                    )
+                else:
+                    item[attr] = item.get(attr, 0) + value
                 updated[attr] = item[attr]
 
         if set_clause:

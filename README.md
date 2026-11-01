@@ -14,9 +14,7 @@ tables look like, and where each alert goes.
 | --- | --- |
 | `DEPLOY.md` | the production checklist: exact steps and commands |
 | `ALERTS_AND_TTL.md` | every alert, and what expires when |
-| `PRODUCTION_REVIEW.md` | a self-review: 16 findings, ranked |
 | `review.md` | an external architecture and security review, with fix status |
-| `KNOWN_ISSUE_shared_track_tag.md` | one defect in detail, now fixed |
 
 
 ---

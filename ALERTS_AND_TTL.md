@@ -17,18 +17,17 @@ Ten of the thirteen signals are **SNS messages** published by this code. Three
 are **CloudWatch alarms**, which AWS raises on its own.
 
 ```
-                       ┌─ the track's own topic, if its budget row names one
-SNS messages ──────────┤
-                       └─ else NOTIFY_TOPIC_ARN, the stack topic from AlertEmail
-
-CloudWatch alarms ───── always the stack topic. They cannot read your budget
-                        table, so they can never be routed per track.
+SNS messages ──────────┐
+                       ├──▶ NOTIFY_TOPIC_ARN, the stack topic from AlertEmail
+CloudWatch alarms ─────┘
 ```
 
-> **Operating rule: do not set `notify_topic_arn` on any budget row yet.**
-> Publishing to a topic with no subscribers *succeeds silently*, so a typo there
-> loses alerts with no error anywhere. Leave every row without it and everything
-> lands on the stack topic.
+**One topic, no routing.** A per-track `notify_topic_arn` on the budget row used
+to override this. It was removed: publishing to a topic with no confirmed
+subscriber *succeeds silently*, so a typo lost alerts with no error anywhere,
+and the Lambdas are scoped to the stack topic alone so any other ARN failed at
+publish time and dead-lettered the batch. A row still carrying the field is
+ignored.
 
 ### The ten emails
 
@@ -63,15 +62,6 @@ everyone else gets a conditional-check failure and sends nothing. That is what
 `_SYSTEM` is not a real track. It is the partition used for problems that belong
 to the whole account rather than to one workload, so you get one email instead
 of one per track.
-
-> **A known rough edge in alert 7.** The stale-card alert is sent from the meter
-> while it is processing one particular track, so it goes to *that track's*
-> topic. Which track wins the daily claim is whichever one happens to be
-> spending first, so the topic is not deterministic. It does not matter today,
-> because no budget row should name its own topic — everything lands on the
-> stack topic. It would matter if you ever started routing per track. Alerts 8
-> and 9 come from the refresh Lambda, which has no track in hand, so those
-> always use the stack topic.
 
 ### The three alarms
 

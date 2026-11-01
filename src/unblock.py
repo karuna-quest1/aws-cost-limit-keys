@@ -11,7 +11,6 @@ import logging
 import os
 from decimal import Decimal
 
-import budgets
 import enforce
 import ledger
 from errors import MalformedLogEntry, NotDisabled, ReactivationFailed
@@ -20,8 +19,7 @@ logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
 USAGE_TABLE = os.environ.get("USAGE_TABLE", "bedrock_usage")
-BUDGET_TABLE = os.environ.get("BUDGET_TABLE", "bedrock_budgets")
-# Fallback only; the budget row's own topic wins. See `_topic_for_track`.
+# The one topic. Every alert from every function lands here.
 NOTIFY_TOPIC_ARN = os.environ.get("NOTIFY_TOPIC_ARN")
 MIN_REASON_CHARS = 10
 
@@ -37,17 +35,10 @@ def clients():
         dynamodb = boto3.resource("dynamodb", config=config)
         _clients.update(
             usage=dynamodb.Table(USAGE_TABLE),
-            # Read-only, and only to find out where this track's alerts go.
-            budgets=dynamodb.Table(BUDGET_TABLE),
             iam=boto3.client("iam", config=config),
             sns=boto3.client("sns", config=config),
         )
     return _clients
-
-
-def _topic_for_track(aws_clients: dict, track: str) -> str | None:
-    """The track's own topic, else the default. Resolved before any mutation."""
-    return budgets.load(aws_clients["budgets"], track).notify_topic_arn or NOTIFY_TOPIC_ARN
 
 
 def _pairs_from(item: dict) -> list[tuple[str, str]]:
@@ -87,10 +78,6 @@ def handler(event, context):
             f"If its key is inactive, it was not this control that deactivated it."
         )
 
-    # Before the first IAM call, so a budget problem refuses rather than
-    # half-performs the release.
-    topic_arn = _topic_for_track(aws_clients, track)
-
     key_pairs = _pairs_from(item)
     reactivated, failures = [], {}
     for user_name, key_id in key_pairs:
@@ -121,7 +108,7 @@ def handler(event, context):
     caller = _caller(context)
     enforce.notify(
         aws_clients["sns"],
-        topic_arn,
+        NOTIFY_TOPIC_ARN,
         f"[Bedrock] RE-ENABLED {track}",
         {
             "track": track,

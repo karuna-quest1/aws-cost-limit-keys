@@ -180,7 +180,7 @@ def _announce_gaps(aws_clients: dict, day: str, result) -> None:
             "day": day,
             "models_priced": len(result.rates),
             "unmapped_price_list_names": list(result.unmapped_names),
-            "cache_rates_defaulted_to_input": list(result.defaulted),
+            "cache_rates_defaulted_from_input": list(result.defaulted),
             "action": (
                 "An unmapped name means that model is not on the card, so it "
                 "prices at pricing.FALLBACK -- expensive, and it alerts daily. "

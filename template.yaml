@@ -214,10 +214,9 @@ Resources:
           NOTIFY_TOPIC_ARN: !Ref AlertTopic
       Policies:
         - DynamoDBCrudPolicy: { TableName: !Ref UsageTable }
-        # Read-only, and only to resolve which topic this track's alerts go to,
-        # so the release announcement lands where the disable page did. This
-        # function must never be able to change a budget.
-        - DynamoDBReadPolicy: { TableName: !Ref BudgetTable }
+        # No grant on the budget table at all. It used to read one, to resolve
+        # which topic a track's alerts went to; there is one topic now, so this
+        # function has no reason to see a budget and cannot.
         - Statement:
             - Effect: Allow
               Action: [sns:Publish]

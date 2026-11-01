@@ -26,7 +26,7 @@ _DEFAULT_ALERT_PCTS = (80, 100)
 _DEFAULT_RUNAWAY_MULTIPLE = Decimal("1.5")
 
 # Fields a partial TRACK# row inherits from DEFAULT rather than from the floor.
-_INHERITABLE = ("daily_usd", "runaway_multiple", "alert_pcts", "notify_topic_arn", "enforce")
+_INHERITABLE = ("daily_usd", "runaway_multiple", "alert_pcts", "enforce")
 
 # Below 1 the key is disabled before the 100% alert, inverting the escalation.
 _MIN_RUNAWAY_MULTIPLE = Decimal("1")
@@ -38,7 +38,6 @@ class Budget(NamedTuple):
     daily_micros: int
     alert_pcts: tuple[int, ...]
     runaway_micros: int
-    notify_topic_arn: str | None
     enforce: bool
 
     @property
@@ -109,17 +108,12 @@ def _to_budget(item: dict, scope: str) -> Budget:
             f"deactivating keys."
         )
 
-    topic_arn = item.get("notify_topic_arn")
-    if topic_arn is not None and not str(topic_arn).startswith("arn:"):
-        raise InvalidBudget(f"{scope}.notify_topic_arn is not an ARN: {topic_arn!r}")
-
     daily_micros = int(daily_usd * 1_000_000)
     return Budget(
         scope=scope,
         daily_micros=daily_micros,
         alert_pcts=_alert_pcts(item, scope),
         runaway_micros=int(Decimal(daily_micros) * runaway_multiple),
-        notify_topic_arn=topic_arn,
         # Absent means watch-only: enforcement is opt-in.
         enforce=enforce_value,
     )

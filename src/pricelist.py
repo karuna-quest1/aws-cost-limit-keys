@@ -63,11 +63,15 @@ _TOKENS_PER_UNIT = {
 _ON_DEMAND_MARKERS = ("ondemand", "on demand")
 _MILLION = Decimal(1_000_000)
 
+# Published cache-write rates sit at about 1.25x input across the Claude models.
+# Used only when a model's price list carries no cache-write SKU at all.
+_CACHE_WRITE_FACTOR = Decimal("1.25")
+
 
 class FetchResult(NamedTuple):
     rates: dict[str, pricing.Rates]
     unmapped_names: tuple[str, ...]  # seen in the price list, absent from MODEL_IDS
-    defaulted: tuple[str, ...]  # "<model_id>.cache_write" priced at the input rate
+    defaulted: tuple[str, ...]  # "<model_id>.cache_write" priced off the input rate
     skus_read: int
 
 
@@ -112,6 +116,10 @@ def _is_on_demand(attributes: dict) -> bool:
     inference = normalize_name(attributes.get("inferenceType", ""))
     if not inference:
         # Absent on some records; the on-demand term lookup still gates those.
+        # A mislabelled batch or provisioned SKU can therefore reach the card.
+        # Accepted risk: the 25% drift guard catches a 50% move from the second
+        # refresh onward, and the first card is read back by `make rates` as
+        # step 8 of the README. See M2 in review.md.
         return True
     flat = inference.replace(" ", "")
     return any(marker in flat or marker in inference for marker in _ON_DEMAND_MARKERS)
@@ -222,12 +230,18 @@ def fetch(pricing_client, region_code: str) -> FetchResult:
             raise PriceListUnavailable(
                 f"{model_id} came back with {sorted(classes)} and no input/output pair"
             )
-        for cache_class in ("cache_read", "cache_write"):
+        # Not every model supports caching, and its cached token counts are then
+        # zero, so these rates never multiply anything. They are still chosen to
+        # err expensive in case we are ever wrong about that: cache reads really
+        # bill at about a tenth of input, so the input rate is ten times too
+        # dear; cache writes bill at about 1.25x input, so the input rate would
+        # be 20% too CHEAP -- the unsafe direction -- hence the multiplier.
+        for cache_class, factor in (
+            ("cache_read", Decimal(1)),
+            ("cache_write", _CACHE_WRITE_FACTOR),
+        ):
             if cache_class not in classes:
-                # Not every model supports caching, and its cached token counts
-                # are then zero, so the rate never multiplies anything. Default
-                # to the input rate: no discount assumed, which errs expensive.
-                classes[cache_class] = classes["input"]
+                classes[cache_class] = classes["input"] * factor
                 defaulted.append(f"{model_id}.{cache_class}")
         rates[model_id] = pricing.Rates(
             input=classes["input"],

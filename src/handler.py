@@ -212,7 +212,6 @@ def apply_budget_policy(
     rates_fetched_at: str | None = None,
 ) -> None:
     budget = budgets.load(aws_clients["budgets"], attribution.track)
-    topic_arn = budget.notify_topic_arn or NOTIFY_TOPIC_ARN
     decision = enforce.evaluate(total, budget)
 
     if stale_rates:
@@ -220,7 +219,6 @@ def apply_budget_policy(
         # pages once a day however many tracks are spending.
         _send_notice_once(
             aws_clients,
-            topic_arn,
             track="_SYSTEM",
             day=day,
             kind="RATECARD_STALE",
@@ -239,7 +237,6 @@ def apply_budget_policy(
     if budget.is_floor:
         _send_notice_once(
             aws_clients,
-            topic_arn,
             track=attribution.track,
             day=day,
             kind="NO_BUDGET",
@@ -257,7 +254,6 @@ def apply_budget_policy(
     if fallback:
         _send_notice_once(
             aws_clients,
-            topic_arn,
             track=attribution.track,
             day=day,
             kind=f"FALLBACK#{model_id}",
@@ -280,7 +276,7 @@ def apply_budget_policy(
             continue  # another invocation already sent this one today
         enforce.notify(
             aws_clients["sns"],
-            topic_arn,
+            NOTIFY_TOPIC_ARN,
             f"[Bedrock] {attribution.track} at {threshold_pct}% of daily budget",
             {
                 "track": attribution.track,
@@ -310,7 +306,7 @@ def apply_budget_policy(
             _format_usd(budget.runaway_micros),
         )
         return
-    disable_track(attribution, day, total, budget, topic_arn, aws_clients)
+    disable_track(attribution, day, total, budget, aws_clients)
 
 
 def disable_track(
@@ -318,7 +314,6 @@ def disable_track(
     day: str,
     total: int,
     budget,
-    topic_arn: str | None,
     aws_clients: dict,
 ) -> None:
     principal = attribution.principal
@@ -352,7 +347,6 @@ def disable_track(
         )
         _send_notice_once(
             aws_clients,
-            topic_arn,
             track=attribution.track,
             day=day,
             kind="UNENFORCEABLE",
@@ -385,7 +379,7 @@ def disable_track(
         # Already disabled. A key that is still active now belongs to a user who
         # started spending afterwards, so it has to be switched off too -- the
         # claim is one-shot and would never fire again for it.
-        _extend_disable(aws_clients, attribution, day, topic_arn, principal_keys, total)
+        _extend_disable(aws_clients, attribution, day, principal_keys, total)
         return
 
     try:
@@ -409,7 +403,7 @@ def disable_track(
 
     enforce.notify(
         aws_clients["sns"],
-        topic_arn,
+        NOTIFY_TOPIC_ARN,
         f"[Bedrock] DISABLED {attribution.track} - runaway spend",
         {
             "track": attribution.track,
@@ -433,7 +427,6 @@ def _extend_disable(
     aws_clients: dict,
     attribution,
     day: str,
-    topic_arn: str | None,
     principal_keys: dict,
     total: int,
 ) -> None:
@@ -457,7 +450,6 @@ def _extend_disable(
     for user_name in sorted(principal_keys):
         _send_notice_once(
             aws_clients,
-            topic_arn,
             track=attribution.track,
             day=day,
             kind=f"DISABLE_EXTENDED#{user_name}",
@@ -478,7 +470,6 @@ def _extend_disable(
 
 def _send_notice_once(
     aws_clients: dict,
-    topic_arn: str | None,
     *,
     track: str,
     day: str,
@@ -489,7 +480,7 @@ def _send_notice_once(
     """At most once per track per day."""
     if not ledger.claim_notice(aws_clients["usage"], track, day, kind):
         return
-    enforce.notify(aws_clients["sns"], topic_arn, subject, body)
+    enforce.notify(aws_clients["sns"], NOTIFY_TOPIC_ARN, subject, body)
 
 
 def _format_usd(micros: int) -> str:

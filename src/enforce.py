@@ -63,7 +63,7 @@ def notify(sns, topic_arn: str | None, subject: str, body: dict) -> str:
     if not topic_arn:
         raise AlertDeliveryFailed(
             f"no SNS topic configured, so this alert has nowhere to go: {subject!r}. "
-            f"Set notify_topic_arn on the budget row or NOTIFY_TOPIC_ARN on the function."
+            f"Set NOTIFY_TOPIC_ARN on the function."
         )
     try:
         response = sns.publish(

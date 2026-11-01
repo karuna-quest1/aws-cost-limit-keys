@@ -80,7 +80,6 @@ def budget_table(daily_usd="50", enforce_flag=False, multiple="1.5", scope=f"TRA
             "daily_usd": Decimal(daily_usd),
             "runaway_multiple": Decimal(multiple),
             "alert_pcts": {80, 100},
-            "notify_topic_arn": TOPIC,
             "enforce": enforce_flag,
         }
     }
@@ -599,7 +598,6 @@ class TestBudgetValidation(unittest.TestCase):
                     "daily_usd": Decimal("25"),
                     "runaway_multiple": Decimal("1.5"),
                     "alert_pcts": {80, 100},
-                    "notify_topic_arn": TOPIC,
                     "enforce": False,
                 },
                 (f"TRACK#{TRACK}",): {"scope": f"TRACK#{TRACK}", "enforce": True},
@@ -609,7 +607,6 @@ class TestBudgetValidation(unittest.TestCase):
         budget = budgets.load(table, TRACK)
         self.assertEqual(budget.daily_usd, Decimal("25"))  # not the $10 floor
         self.assertTrue(budget.enforce)  # its own value wins
-        self.assertEqual(budget.notify_topic_arn, TOPIC)
 
     def test_a_complete_row_costs_one_read(self):
         table = budget_table()
@@ -617,7 +614,7 @@ class TestBudgetValidation(unittest.TestCase):
         self.assertEqual(len(table.calls), 1)
 
     def test_evaluate_refuses_a_zero_budget_as_a_second_line_of_defence(self):
-        zero_budget = budgets.Budget("TRACK#x", 0, (80,), 0, None, True)
+        zero_budget = budgets.Budget("TRACK#x", 0, (80,), 0, True)
         with self.assertRaises(errors.InvalidBudget):
             enforce.evaluate(1_000_000, zero_budget)
 
@@ -695,15 +692,15 @@ class TestUnpack(unittest.TestCase):
 # 9. The release path, and where it announces
 # --------------------------------------------------------------------------
 class TestUnblock(WiredTestCase):
-    """The disable page and the release announcement must land in one place.
+    """The release path: it must reactivate, clear, and announce.
 
-    `unblock` used to publish to NOTIFY_TOPIC_ARN unconditionally, so a track
-    whose budget row named its own topic had the meter page one audience and the
-    release announced to another -- the rota woken up to fix a disabled track
-    never saw the record of it being released.
+    There was once a per-track `notify_topic_arn`, and `unblock` ignored it --
+    so the meter paged one audience and the release announced to another. The
+    field has since been removed and every alert goes to one topic, which makes
+    that whole class of bug unreachable rather than merely tested for. The two
+    tests that guarded it are gone with the feature; what remains is that the
+    release does announce, on the one topic there is.
     """
-
-    PROD_TOPIC = "arn:aws:sns:us-east-1:123456789012:prod-pager"
 
     def setUp(self):
         super().setUp()
@@ -719,11 +716,9 @@ class TestUnblock(WiredTestCase):
         unblock._clients.clear()
         super().tearDown()
 
-    def _disable_track(self, row_topic=None):
+    def _disable_track(self):
         """Run a track past its ceiling so there is something to release."""
         aws_clients = self._aws_clients = wiring(daily_usd="0.01", enforce_flag=True)
-        if row_topic is not None:
-            aws_clients["budgets"].items[(f"TRACK#{TRACK}",)]["notify_topic_arn"] = row_topic
         handler.handler(cloudwatch_event([log_entry()]), None)
         return aws_clients
 
@@ -734,27 +729,17 @@ class TestUnblock(WiredTestCase):
             if alert["TopicArn"] == topic
         ]
 
-    def test_release_is_announced_on_the_tracks_own_topic(self):
-        aws_clients = self._disable_track(row_topic=self.PROD_TOPIC)
-        self.assertTrue(
-            any(
-                "DISABLED" in subject
-                for subject in self._subjects_to(aws_clients, self.PROD_TOPIC)
-            )
-        )
-
+    def test_the_disable_and_the_release_land_on_the_same_topic(self):
+        """One topic, so the incident thread cannot split."""
+        aws_clients = self._disable_track()
         unblock.handler({"track": TRACK, "reason": "wave stopped, loop cap added"}, None)
 
-        on_prod = self._subjects_to(aws_clients, self.PROD_TOPIC)
-        self.assertTrue(any("RE-ENABLED" in subject for subject in on_prod))
-        # and nothing leaked to the stack default
-        self.assertEqual(self._subjects_to(aws_clients, TOPIC), [])
-
-    def test_release_falls_back_to_the_default_topic(self):
-        aws_clients = self._disable_track()  # budget row names no topic
-        unblock.handler({"track": TRACK, "reason": "wave stopped, loop cap added"}, None)
-        self.assertTrue(
-            any("RE-ENABLED" in subject for subject in self._subjects_to(aws_clients, TOPIC))
+        subjects = self._subjects_to(aws_clients, TOPIC)
+        self.assertTrue(any("DISABLED" in subject for subject in subjects))
+        self.assertTrue(any("RE-ENABLED" in subject for subject in subjects))
+        # every alert published went there, none anywhere else
+        self.assertEqual(
+            {alert["TopicArn"] for alert in aws_clients["sns"].published}, {TOPIC}
         )
 
     def test_the_release_actually_reactivates_and_clears(self):
@@ -766,15 +751,6 @@ class TestUnblock(WiredTestCase):
             ["AKIAEXAMPLE1", "AKIAEXAMPLE2"],
         )
         self.assertNotIn((f"TRACK#{TRACK}", "DISABLED"), aws_clients["usage"].items)
-
-    def test_a_failed_budget_read_refuses_before_touching_anything(self):
-        """Resolved first, so the keys are not reactivated and then left unannounced."""
-        aws_clients = self._disable_track()
-        aws_clients["budgets"].fail_on.add("get_item")
-        with self.assertRaises(errors.BudgetUnavailable):
-            unblock.handler({"track": TRACK, "reason": "wave stopped, loop cap added"}, None)
-        self.assertEqual(aws_clients["iam"].activated, [])
-        self.assertIn((f"TRACK#{TRACK}", "DISABLED"), aws_clients["usage"].items)
 
     def test_re_enabling_something_not_disabled_is_refused(self):
         self._aws_clients = wiring()
@@ -964,15 +940,46 @@ class TestPriceListParsing(unittest.TestCase):
         result = pricelist.fetch(FakePricing(pages), "us-east-1")
         self.assertEqual(result.rates[SONNET_ID].input, Decimal("3.000"))
 
-    def test_a_model_without_caching_defaults_to_the_input_rate(self):
-        """Its cached token counts are zero, so this never multiplies anything."""
+    def test_a_model_without_caching_defaults_its_cache_rates_expensive(self):
+        """Both defaults must err dear, and they need different multipliers.
+
+        Real cache reads bill at about a tenth of input, so the input rate is
+        ten times too dear -- safe. Real cache writes bill at about 1.25x
+        input, so the input rate would be 20% too CHEAP, which is the direction
+        that lets spend through. Hence the 1.25 factor on cache_write only.
+        """
         skus = sonnet_price_list()[:2]  # input and output only
         result = pricelist.fetch(FakePricing([skus]), "us-east-1")
-        self.assertEqual(result.rates[SONNET_ID].cache_read, Decimal("3.000"))
+        rates = result.rates[SONNET_ID]
+        self.assertEqual(rates.input, Decimal("3.000"))
+        self.assertEqual(rates.cache_read, Decimal("3.000"))
+        self.assertEqual(rates.cache_write, Decimal("3.75000"))
+        self.assertGreater(rates.cache_write, rates.input)
         self.assertEqual(
             sorted(result.defaulted),
             [f"{SONNET_ID}.cache_read", f"{SONNET_ID}.cache_write"],
         )
+
+    def test_an_unlabelled_sku_is_accepted(self):
+        """Deliberate: a missing inferenceType must not lose a genuine rate.
+
+        The risk this leaves -- a mislabelled batch SKU read as on-demand -- is
+        an accepted one, bounded only by the 25% drift guard from the second
+        refresh onward. Pinned here so the choice cannot drift either way
+        unnoticed. See M2 in review.md and the comment in _is_on_demand.
+        """
+        skus = [
+            price_list_product(usage_type=usage, inference_type="", sku=f"SKU-{n}")
+            for n, usage in enumerate(("USE1-InputTokenCount", "USE1-OutputTokenCount"))
+        ]
+        result = pricelist.fetch(FakePricing([skus]), "us-east-1")
+        self.assertEqual(result.rates[SONNET_ID].input, Decimal("3.000"))
+
+    def test_the_same_rate_arriving_twice_is_fine(self):
+        """Only a conflict is an error; a duplicate of the same price is not."""
+        pages = [sonnet_price_list() + sonnet_price_list()]
+        result = pricelist.fetch(FakePricing(pages), "us-east-1")
+        self.assertEqual(result.rates[SONNET_ID].input, Decimal("3.000"))
 
     def test_a_model_missing_its_output_rate_raises(self):
         """Half a card is worse than none: it would under-count every reply."""

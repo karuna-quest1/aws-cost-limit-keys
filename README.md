@@ -523,7 +523,6 @@ Configuration. You edit this; the system only reads it. Tiny, never expires.
 | `daily_usd` | number | `50` | must be **> 0** |
 | `runaway_multiple` | number | `1.5` | must be **≥ 1**; deactivate at `daily_usd × this` |
 | `alert_pcts` | number set | `{80, 100}` | non-empty, each 1–1000 |
-| `notify_topic_arn` | string | `arn:aws:sns:...` | optional — **leave it out**, see the warning below |
 | `enforce` | boolean | `false` | must be a real boolean, not `"false"` |
 | `updated_at` | string | `2026-10-08T09:12:00Z` | audit trail only |
 
@@ -560,9 +559,14 @@ TRACK#x.daily_usd must be greater than zero, got 0. To stop a track spending,
 deactivate its key; a zero budget disables the limit rather than the track.
 ```
 
-> ⚠️ **Do not set `notify_topic_arn` yet.** The override works, but nothing
-> checks that the topic you name has a confirmed subscriber — and publishing to a
-> topic with no subscribers *succeeds silently*.
+> **There is no per-track topic.** A `notify_topic_arn` field used to exist
+> here. It was removed: nothing checked that the topic you named had a confirmed
+> subscriber, and publishing to a topic with no subscribers *succeeds silently*,
+> so the field could only ever lose alerts. Worse, the Lambdas are scoped to
+> publish to the stack topic alone, so naming any other ARN passed validation
+> and then failed at publish time — taking the whole batch to the dead-letter
+> queue. Every alert now goes to one topic. A row carrying the old field is
+> simply ignored.
 
 ### `bedrock_usage`
 
@@ -714,31 +718,35 @@ Everything goes to **one SNS topic**, `bedrock-cost-limits-alerts`, and from the
 to whoever is subscribed to it. One email address subscribed means one inbox
 receives all of this.
 
-| Alert | Sent when | How often | Topic |
-| --- | --- | --- | --- |
-| `at 80% of daily budget` | spend ≥ 80% of `daily_usd` | once per day | track's, else default |
-| `at 100% of daily budget` | spend ≥ 100% | once per day | track's, else default |
-| `DISABLED <track> — runaway spend` | past the ceiling **and** `enforce: true` | once | track's, else default |
-| `RE-ENABLED <track>` | someone ran `make unblock` | once | track's, else default |
-| `<track> has no budget row` | the $10 floor was applied | once per day | track's, else default |
-| `unpriced model used by <track>` | that model is not in the price list | once per day **per model** | track's, else default |
-| `cannot stop <track> — no access key` | past the ceiling, nothing to deactivate | once per day | track's, else default |
-| `rate card REJECTED — prices not updated` | a fetch failed validation; nothing was written | once per day | **always the default** |
-| `rate card refreshed with gaps` | a model name has no `MODEL_IDS` line | once per day | **always the default** |
-| `rate card has not refreshed in weeks` | no successful refresh for 30 days | once per day, all tracks | track's, else default |
-| **`bedrock-cost-limits-meter-errors`** | the meter itself failed | per 5-minute window | **always the default** |
-| **`bedrock-cost-limits-meter-dlq-not-empty`** | a batch gave up after retries | per 5-minute window | **always the default** |
-| **`bedrock-cost-limits-rate-refresh-errors`** | the price refresh itself failed | per 5-minute window | **always the default** |
+| Alert | Sent when | How often |
+| --- | --- | --- |
+| `at 80% of daily budget` | spend ≥ 80% of `daily_usd` | once per day |
+| `at 100% of daily budget` | spend ≥ 100% | once per day |
+| `DISABLED <track> — runaway spend` | past the ceiling **and** `enforce: true` | once |
+| `RE-ENABLED <track>` | someone ran `make unblock` | once |
+| `<track> has no budget row` | the $10 floor was applied | once per day |
+| `unpriced model used by <track>` | that model is not in the price list | once per day **per model** |
+| `cannot stop <track> — no access key` | past the ceiling, nothing to deactivate | once per day |
+| `rate card REJECTED — prices not updated` | a fetch failed validation; nothing was written | once per day |
+| `rate card refreshed with gaps` | a model name has no `MODEL_IDS` line | once per day |
+| `rate card has not refreshed in weeks` | no successful refresh for 30 days | once per day, all tracks |
+| **`bedrock-cost-limits-meter-errors`** | the meter itself failed | per 5-minute window |
+| **`bedrock-cost-limits-meter-dlq-not-empty`** | a batch gave up after retries | per 5-minute window |
+| **`bedrock-cost-limits-rate-refresh-errors`** | the price refresh itself failed | per 5-minute window |
 
-"track's, else default" means: the track's budget row can name its own topic, and
-if it does not, the stack's topic is used. **Right now no row should name one**
-— an alert published to a topic with no subscribers succeeds silently — so in
-practice everything lands on the stack topic.
+**There is one topic and no routing.** Every alert above, from every function,
+publishes to `bedrock-cost-limits-alerts`. There used to be a per-track override
+on the budget row; it was removed, because a topic with no confirmed subscriber
+accepts a publish and discards it, so the only thing the override could reliably
+do was lose alerts.
 
-The bold ones are AWS watching AWS, or this control watching itself — neither
-reads your budget table, so they can never be routed per track. That is correct:
-"the meter is broken" and "prices are stale" are platform problems, not one
-track's problem.
+That also means `unblock` no longer reads the budget table at all — it had one
+read, purely to work out where to announce — and its IAM policy no longer grants
+it any access to that table.
+
+The bold entries are AWS watching AWS, or this control watching itself. They are
+CloudWatch alarms rather than messages this code publishes, which is why they
+say nothing about *which* track or *why* — see the alarm note below.
 
 ### The three alarms mean different things
 

@@ -3,6 +3,21 @@
 A step-by-step guide to getting this running, what you have to supply, what the
 tables look like, and where each alert goes.
 
+> **In a hurry, or deploying for real?** `DEPLOY.md` is the copy-paste checklist
+> — ten steps, a verification command after each, what to do when a track gets
+> disabled, how to roll back, and the known gaps to close first. This file
+> explains *why*; that one is the order of operations.
+
+**The other documents**
+
+| File | What it is |
+| --- | --- |
+| `DEPLOY.md` | the production checklist: exact steps and commands |
+| `ALERTS_AND_TTL.md` | every alert, and what expires when |
+| `PRODUCTION_REVIEW.md` | a self-review: 16 findings, ranked |
+| `review.md` | an external architecture and security review, with fix status |
+| `KNOWN_ISSUE_shared_track_tag.md` | one defect in detail, now fixed |
+
 
 ---
 

@@ -1494,5 +1494,77 @@ class TestTemplatePermissions(unittest.TestCase):
         """Widening the verbs must not have widened the key prefix."""
         text = open(self.TEMPLATE, encoding="utf-8").read()
         self.assertIn('dynamodb:LeadingKeys: ["RATECARD#*"]', text)
+
+# --------------------------------------------------------------------------
+# 13. The log group is the trust boundary. Validate values, not just shape.
+# --------------------------------------------------------------------------
+class TestLogEntryValues(WiredTestCase):
+    """A forged or corrupt entry must not move the ledger arbitrarily.
+
+    The handler already checked that requestId and modelId exist. These are the
+    value checks: a schema rename must not price every call at zero, and no
+    single entry may add or subtract an arbitrary amount.
+    """
+
+    def _submit(self, entry):
+        self._aws_clients = wiring()
+        with self.assertRaises(errors.BatchIncomplete) as caught:
+            handler.handler(cloudwatch_event([entry]), None)
+        return caught.exception.failures[0][1]
+
+    def test_an_entry_with_no_count_field_at_all_is_refused(self):
+        """Absent is not zero. Pricing it at nothing is an unlimited budget."""
+        entry = log_entry()
+        del entry["input"]
+        del entry["output"]
+        self.assertIsInstance(self._submit(entry), errors.MalformedLogEntry)
+
+    def test_renamed_count_fields_are_refused_not_priced_at_zero(self):
+        """What a Bedrock schema bump would look like."""
+        entry = log_entry()
+        entry["input"] = {"inputTokens": 12_400}
+        entry["output"] = {"outputTokens": 850}
+        failure = self._submit(entry)
+        self.assertIsInstance(failure, errors.MalformedLogEntry)
+        self.assertIn("token count fields", str(failure))
+
+    def test_all_four_counts_present_and_zero_is_accepted(self):
+        """A real invocation can legitimately report zeros; it must not DLQ."""
+        aws_clients = self._aws_clients = wiring()
+        stats = handler.handler(
+            cloudwatch_event([log_entry(in_tokens=0, out_tokens=0, cache_read=0)]), None
+        )
+        self.assertEqual(stats["counted"], 1)
+        self.assertEqual(int(day_row(aws_clients)["spent_micros"]), 0)
+
+    def test_a_negative_count_is_refused(self):
+        """ADD applies a negative, moving a track back under its ceiling."""
+        failure = self._submit(log_entry(in_tokens=-5000))
+        self.assertIsInstance(failure, errors.MalformedLogEntry)
+        self.assertIn("negative", str(failure))
+
+    def test_an_implausible_count_is_refused(self):
+        failure = self._submit(log_entry(in_tokens=999_999_999))
+        self.assertIsInstance(failure, errors.MalformedLogEntry)
+        self.assertIn("more than", str(failure))
+
+    def test_a_refused_entry_moves_the_ledger_by_nothing(self):
+        """The whole point: a forged figure must not reach spent_micros."""
+        aws_clients = self._aws_clients = wiring()
+        with self.assertRaises(errors.BatchIncomplete):
+            handler.handler(cloudwatch_event([log_entry(in_tokens=999_999_999)]), None)
+        self.assertNotIn(
+            (f"TRACK#{TRACK}", f"DAY#{ledger.utc_day()}"), aws_clients["usage"].items
+        )
+
+    def test_the_largest_real_context_is_still_accepted(self):
+        """The bound is a sanity check, not a usage limit -- no false DLQs."""
+        aws_clients = self._aws_clients = wiring()
+        stats = handler.handler(
+            cloudwatch_event([log_entry(in_tokens=1_000_000, cache_read=0)]), None
+        )
+        self.assertEqual(stats["counted"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

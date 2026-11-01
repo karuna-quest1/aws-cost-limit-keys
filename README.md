@@ -218,6 +218,19 @@ aws iam put-role-policy --role-name BedrockInvocationLoggingRole \
   --policy-name WriteInvocationLogs --policy-document file:///tmp/perms.json
 ```
 
+**3. Check who else can write to that log group.** This matters more than it
+looks: the log group is the trust boundary for the whole control. Anything that
+can write to it can claim any identity and any figure, and the meter has no way
+to tell a forged line from a real one. See [the threat
+model](#threat-model-the-log-group-is-the-trust-boundary) before you turn
+enforcement on.
+
+```bash
+# anything granting logs:PutLogEvents on Resource "*" can write forged entries
+aws accessanalyzer start-policy-generation --help >/dev/null 2>&1 \
+  && echo "IAM Access Analyzer is available - use it to review who holds logs:* in this account"
+```
+
 ### Step 6 — enable invocation logging
 
 **Bedrock invocation logging is off by default.** Until you turn it on, nothing
@@ -871,6 +884,58 @@ batch {'seen': 12, 'counted': 11, 'duplicate': 1, 'failed': 0}
 | `counted` | **the meter is running and recording nothing** |
 | `duplicate` | normal |
 | `failed` | normal |
+
+---
+
+## Threat model: the log group is the trust boundary
+
+Everything this control does is driven by lines in
+`/aws/bedrock/modelinvocations`. **It cannot verify them.** A log entry carries
+no signature and nothing that ties it to a real Bedrock call, so any principal
+with `logs:PutLogEvents` on that group can write:
+
+```json
+{ "requestId": "forged-1",
+  "modelId": "anthropic.claude-opus-4-1-20250805-v1:0",
+  "identity": { "arn": "arn:aws:iam::123456789012:user/BedrockDev-victim" },
+  "input": { "inputTokenCount": 1999999 } }
+```
+
+The meter attributes that spend to `BedrockDev-victim`'s track. Enough of them
+and the track crosses its ceiling and **that team's access keys are
+deactivated** — a denial of service against another workload, from writing a
+log line. The IAM user names are guessable by design (`BedrockDev-<track>`).
+
+### What limits it
+
+| Control | Effect | Confidence |
+| --- | --- | --- |
+| **Restrict `logs:PutLogEvents` on this log group** to the Bedrock service role | the only thing that closes it | the real fix |
+| `enforce: false` (the default) | a forged line produces false alerts, never a deactivation | certain |
+| Per-entry value bounds in `handler._usage_of` | one entry cannot claim more than 2,000,000 tokens per class, or a negative figure | certain, but only bounds the size |
+| `MAX_RATE_DELTA_PCT`, the budget floor, the two-key gate | unaffected by this — they constrain config, not input | n/a |
+
+The per-entry bound is a **sanity bound, not a security boundary.** It stops one
+line moving the ledger by an arbitrary amount; it does not stop an attacker
+writing several. Do not treat it as the mitigation.
+
+### What to do
+
+1. **Audit who holds `logs:PutLogEvents` in the account.** A broad
+   `logs:*` on `Resource: "*"` — common in CI roles and admin policies — is
+   write access to this log group. That is the exposure.
+2. **If you use AWS Organizations, add an SCP** denying `logs:PutLogEvents` on
+   this log group ARN for everything except the Bedrock service principal. An
+   SCP applies to every principal in the account, which identity policies
+   reviewed one at a time cannot guarantee.
+3. **Until step 1 is done, leave `enforce: false`.** Metering and alerting on
+   forged data is misleading; deactivating keys on it is an outage.
+
+A CloudWatch Logs *resource* policy is the obvious-looking fix and is worth
+testing, but resource policies on log groups exist mainly to grant other AWS
+services write access, and whether a `Deny` there reliably blocks same-account
+IAM principals is not something this project has verified. Confirm it in your
+own account before relying on it; the SCP route is the one with no ambiguity.
 
 ---
 

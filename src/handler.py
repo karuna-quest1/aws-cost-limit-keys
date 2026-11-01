@@ -96,6 +96,40 @@ def _request_id_of(message: str) -> str:
         return "<unparseable>"
 
 
+def _usage_of(entry: dict, request_id: str) -> pricing.Usage:
+    """The four token counts, refusing values a real invocation cannot produce.
+
+    The log group is the trust boundary: anything able to write to it can claim
+    any identity and any figure. These checks do not make a forged line
+    impossible -- only a log-group resource policy does that, see README.md --
+    but they stop a single malformed or forged entry from moving the ledger by
+    an arbitrary amount, or from pricing a call at nothing.
+    """
+    # Absent is not the same as zero. A schema bump that renames the fields
+    # would otherwise make every invocation free, which is an unlimited budget
+    # -- the exact failure pricing.FALLBACK exists to prevent.
+    if not pricing.has_any_count_field(entry):
+        raise errors.MalformedLogEntry(
+            f"log entry {request_id} carries none of the four token count fields "
+            f"(schemaVersion {entry.get('schemaVersion')!r}); pricing it would "
+            f"charge zero for a real invocation"
+        )
+
+    usage = pricing.usage_from_log(entry)
+    if min(usage) < 0:
+        # ADD applies a negative, so this would subtract from the day's total
+        # and move a track back under its ceiling.
+        raise errors.MalformedLogEntry(
+            f"log entry {request_id} has a negative token count: {usage}"
+        )
+    if max(usage) > pricing.MAX_PLAUSIBLE_TOKENS:
+        raise errors.MalformedLogEntry(
+            f"log entry {request_id} claims more than "
+            f"{pricing.MAX_PLAUSIBLE_TOKENS:,} tokens in one call: {usage}"
+        )
+    return usage
+
+
 def process_log_entry(message: str, aws_clients: dict) -> str:
     """One invocation log line. Returns the stats key it belongs to."""
     try:
@@ -118,7 +152,7 @@ def process_log_entry(message: str, aws_clients: dict) -> str:
 
     arn = (entry.get("identity") or {}).get("arn", "")
     attribution = identity.resolve(arn, aws_clients["iam"], aws_clients["usage"])
-    usage = pricing.usage_from_log(entry)
+    usage = _usage_of(entry, request_id)
     # Memoised for 15 minutes, so this is one extra read per container, not per
     # line. No card, or no entry on it, means this model prices at FALLBACK.
     card = ratecard.load(aws_clients["budgets"])

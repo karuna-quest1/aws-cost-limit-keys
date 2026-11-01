@@ -5,7 +5,29 @@ from __future__ import annotations
 from decimal import Decimal, ROUND_HALF_UP
 from typing import NamedTuple
 
-__all__ = ["Rates", "Usage", "PricedUsage", "price", "usage_from_log", "FALLBACK"]
+__all__ = [
+    "Rates",
+    "Usage",
+    "PricedUsage",
+    "price",
+    "usage_from_log",
+    "has_any_count_field",
+    "MAX_PLAUSIBLE_TOKENS",
+    "FALLBACK",
+]
+
+# The four count fields, spelled once. The cache two are real but absent from
+# AWS's documented schema table -- do not delete them after reading the
+# reference, confirm the spelling against a real log line instead.
+INPUT_TOKEN_FIELD = "inputTokenCount"
+OUTPUT_TOKEN_FIELD = "outputTokenCount"
+CACHE_READ_FIELD = "cacheReadInputTokenCount"
+CACHE_WRITE_FIELD = "cacheWriteInputTokenCount"
+
+# A sanity bound, not a security boundary. The largest advertised Bedrock
+# context is around a million tokens, so anything past this is corrupt or
+# forged, never a real invocation. See the threat model in README.md.
+MAX_PLAUSIBLE_TOKENS = 2_000_000
 
 
 class Rates(NamedTuple):
@@ -86,14 +108,25 @@ def price(usage: Usage, model_id: str, rates: Rates | None = None) -> PricedUsag
 
 def usage_from_log(entry: dict) -> Usage:
     """The four token counts from one log entry. A missing field means zero."""
-    # The cache fields are real but absent from AWS's documented schema table.
-    # Do not delete them after reading the reference -- confirm the spelling
-    # against a real log line instead.
     input_counts = entry.get("input") or {}
     output_counts = entry.get("output") or {}
     return Usage(
-        input_tokens=int(input_counts.get("inputTokenCount") or 0),
-        output_tokens=int(output_counts.get("outputTokenCount") or 0),
-        cache_read_tokens=int(input_counts.get("cacheReadInputTokenCount") or 0),
-        cache_write_tokens=int(input_counts.get("cacheWriteInputTokenCount") or 0),
+        input_tokens=int(input_counts.get(INPUT_TOKEN_FIELD) or 0),
+        output_tokens=int(output_counts.get(OUTPUT_TOKEN_FIELD) or 0),
+        cache_read_tokens=int(input_counts.get(CACHE_READ_FIELD) or 0),
+        cache_write_tokens=int(input_counts.get(CACHE_WRITE_FIELD) or 0),
+    )
+
+
+def has_any_count_field(entry: dict) -> bool:
+    """True if the entry carries at least one of the four counts, at any value.
+
+    Distinct from "all four are zero", which is a legitimate log line. A schema
+    change that renames the fields would otherwise price every call at nothing.
+    """
+    input_counts = entry.get("input") or {}
+    output_counts = entry.get("output") or {}
+    return OUTPUT_TOKEN_FIELD in output_counts or any(
+        name in input_counts
+        for name in (INPUT_TOKEN_FIELD, CACHE_READ_FIELD, CACHE_WRITE_FIELD)
     )

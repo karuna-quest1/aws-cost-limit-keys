@@ -270,8 +270,12 @@ Resources:
               Resource: !Ref AlertTopic
             # Rate card rows only. Without the condition this function could
             # rewrite a track's budget, which is the one thing it must not do.
+            # DeleteItem is required: _rotate deletes the two-card-old dated
+            # row, which is what keeps this at exactly two rows. Without it the
+            # third weekly run raises AccessDenied before promoting anything,
+            # and every run after it fails identically.
             - Effect: Allow
-              Action: [dynamodb:GetItem, dynamodb:PutItem]
+              Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:DeleteItem]
               Resource: !GetAtt BudgetTable.Arn
               Condition:
                 ForAllValues:StringLike:

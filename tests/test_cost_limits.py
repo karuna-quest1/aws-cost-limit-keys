@@ -1379,6 +1379,53 @@ class TestSharedTrackTag(WiredTestCase):
         )
         self.assertEqual(aws_clients["iam"]._keys_of(USER_Y), [("AKIA-Y1", "Active")])
 
+    def test_a_user_deleted_after_it_spent_does_not_abort_the_disable(self):
+        """One stale name must not leave the rest of the track spending."""
+        aws_clients = self._wire(daily_usd="0.1")
+        self._call("x1", ARN_X)
+        self._call("y1", ARN_Y)
+        self.assertEqual(day_row(aws_clients)["user_principals"], {USER_X, USER_Y})
+
+        # USER_Y is offboarded between spending and the breach
+        del aws_clients["iam"].access_keys[USER_Y]
+        del aws_clients["iam"].tags[USER_Y]
+
+        self._call("x2", ARN_X)  # trips the ceiling
+
+        self.assertEqual(
+            sorted(key for _, key in aws_clients["iam"].deactivated),
+            ["AKIA-X1", "AKIA-X2"],
+        )
+        record = aws_clients["usage"].items[(f"TRACK#{TRACK}", "DISABLED")]
+        self.assertEqual(record["principals"], {USER_X})
+
+    def test_the_fake_refuses_an_unknown_user_the_way_iam_does(self):
+        """Without this the test above passes even with the tolerance removed.
+
+        A fake that returns an empty list for a user that does not exist makes
+        a deleted user indistinguishable from a user with no keys -- which is
+        exactly how the aborted-disable bug stayed invisible.
+        """
+        aws_clients = self._wire()
+        with self.assertRaises(Exception) as caught:
+            aws_clients["iam"].list_access_keys(UserName="never-existed")
+        self.assertEqual(errors.aws_error_code(caught.exception), "NoSuchEntity")
+        # and enforce reads that as "no keys", not as a failure to look
+        self.assertEqual(
+            enforce.access_keys_for_user(aws_clients["iam"], "never-existed"), set()
+        )
+
+    def test_a_lookup_failure_that_is_not_a_deletion_still_raises(self):
+        """Only NoSuchEntity is benign; a throttle must not read as "no keys"."""
+        aws_clients = self._wire(daily_usd="0.01")
+        aws_clients["iam"].fail_list_keys = True
+        with self.assertRaises(errors.BatchIncomplete) as caught:
+            handler.handler(
+                cloudwatch_event([log_entry(request_id="x1", arn=ARN_X)]), None
+            )
+        self.assertIsInstance(caught.exception.failures[0][1], errors.KeyLookupFailed)
+        self.assertNotIn((f"TRACK#{TRACK}", "DISABLED"), aws_clients["usage"].items)
+
     def test_no_key_anywhere_on_the_track_still_refuses_to_claim(self):
         aws_clients = self._wire(daily_usd="0.01", keys_y=())
         aws_clients["iam"].access_keys[USER_X] = []
@@ -1389,5 +1436,63 @@ class TestSharedTrackTag(WiredTestCase):
         subjects = [a["Subject"] for a in aws_clients["sns"].published]
         self.assertTrue(any("no access key" in s for s in subjects))
 
+# --------------------------------------------------------------------------
+# 12. The IAM policy against the API calls the code makes.
+# --------------------------------------------------------------------------
+class TestTemplatePermissions(unittest.TestCase):
+    """The one class of bug the fakes cannot catch.
+
+    FakeTable has no IAM layer, so a policy that is missing a verb the code
+    calls passes every other test in this file and fails only in production.
+    That is how the refresher shipped unable to delete the row it rotates.
+
+    Deliberately a text scan rather than a YAML parse: this suite runs on the
+    standard library alone, and PyYAML is not part of it.
+    """
+
+    TEMPLATE = os.path.join(os.path.dirname(__file__), os.pardir, "template.yaml")
+
+    def _granted_dynamodb_actions(self, resource_name):
+        import re
+
+        text = open(self.TEMPLATE, encoding="utf-8").read()
+        start = text.index("\n  " + resource_name + ":")
+        following = re.search(r"\n  [A-Z]\w+:\n", text[start + 1 :])
+        end = start + 1 + (following.start() if following else len(text))
+        actions = set()
+        for line in text[start:end].splitlines():
+            # Action lines only -- the LeadingKeys condition is not an action.
+            if "Action:" in line and "dynamodb:" in line:
+                actions.update(re.findall(r"dynamodb:(\w+)", line))
+        return actions
+
+    def test_the_refresher_may_delete_the_row_it_rotates(self):
+        source = open(
+            os.path.join(os.path.dirname(__file__), os.pardir, "src", "ratecard.py"),
+            encoding="utf-8",
+        ).read()
+        called = {
+            verb
+            for verb, action in (
+                ("get_item", "GetItem"),
+                ("put_item", "PutItem"),
+                ("delete_item", "DeleteItem"),
+            )
+            if "table." + verb + "(" in source
+        }
+        self.assertEqual(called, {"get_item", "put_item", "delete_item"})
+
+        granted = self._granted_dynamodb_actions("RefreshRatesFunction")
+        for action in ("GetItem", "PutItem", "DeleteItem"):
+            self.assertIn(
+                action,
+                granted,
+                f"ratecard.py calls it but RefreshRatesFunction cannot {action}",
+            )
+
+    def test_the_refresher_is_still_confined_to_rate_card_rows(self):
+        """Widening the verbs must not have widened the key prefix."""
+        text = open(self.TEMPLATE, encoding="utf-8").read()
+        self.assertIn('dynamodb:LeadingKeys: ["RATECARD#*"]', text)
 if __name__ == "__main__":
     unittest.main()

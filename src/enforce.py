@@ -16,6 +16,7 @@ from errors import (
     DeactivationFailed,
     InvalidBudget,
     KeyLookupFailed,
+    aws_error_code,
 )
 
 logger = logging.getLogger(__name__)
@@ -91,6 +92,14 @@ def access_keys_for_user(iam, user_name: str) -> set[str]:
     try:
         response = iam.list_access_keys(UserName=user_name)
     except Exception as exc:
+        if aws_error_code(exc) == "NoSuchEntity":
+            # Deleted since it spent. It genuinely has no keys, and raising here
+            # would abort the whole track's disable over one stale name -- the
+            # remaining users would keep spending with the ledger saying stopped.
+            logger.warning(
+                "no IAM user %r, so it has no keys to deactivate", user_name
+            )
+            return set()
         raise KeyLookupFailed(
             f"could not list access keys for {user_name!r}, so there is no "
             f"way to know what to deactivate: {exc!r}"

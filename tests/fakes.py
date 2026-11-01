@@ -226,6 +226,13 @@ class FakeIAM:
     def list_access_keys(self, UserName):
         if self.fail_list_keys:
             raise ThrottlingException()
+        if UserName not in self.access_keys and UserName not in self.tags:
+            # What IAM does for a user that does not exist. Returning an empty
+            # list instead is the leniency that hid the aborted-disable bug: a
+            # user deleted after it spent looked identical to one with no keys.
+            raise _AwsError(
+                "NoSuchEntity", f"The user with name {UserName} cannot be found."
+            )
         return {
             "AccessKeyMetadata": [
                 {"AccessKeyId": key_id, "Status": status}
